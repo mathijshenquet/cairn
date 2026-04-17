@@ -1,0 +1,611 @@
+"""
+Core behavior tests for Cairn.
+
+These tests define expected behavior and serve as the TDD spec.
+They use a test Runtime that provides an in-memory store and trace sink.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import pytest
+
+from cairn import step, trace, cached_output, cached_tracing, Handle
+from cairn.testing import Runtime
+
+
+
+# ── Basic memoization ──
+
+
+@pytest.mark.asyncio
+async def test_step_returns_handle():
+    """Calling a @step function returns a Handle, not the result."""
+
+    @step
+    async def add(a: int, b: int) -> int:
+        return a + b
+
+    async with Runtime() as rt:
+        h = add(1, 2)
+        assert isinstance(h, Handle)
+        assert await h == 3
+
+
+@pytest.mark.asyncio
+async def test_memo_caches_on_same_args():
+    """Second call with same args returns cached result without calling the body."""
+    call_count = 0
+
+    @step(memo=True)
+    async def add(a: int, b: int) -> int:
+        nonlocal call_count
+        call_count += 1
+        return a + b
+
+    async with Runtime() as rt:
+        assert await add(1, 2) == 3
+        assert call_count == 1
+
+        assert await add(1, 2) == 3
+        assert call_count == 1  # not called again
+
+
+@pytest.mark.asyncio
+async def test_memo_misses_on_different_args():
+    """Different args produce a cache miss."""
+    call_count = 0
+
+    @step(memo=True)
+    async def add(a: int, b: int) -> int:
+        nonlocal call_count
+        call_count += 1
+        return a + b
+
+    async with Runtime() as rt:
+        assert await add(1, 2) == 3
+        assert await add(2, 3) == 5
+        assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_default_no_memo():
+    """By default (memo=False), the body is always called."""
+    call_count = 0
+
+    @step
+    async def greet(name: str) -> str:
+        nonlocal call_count
+        call_count += 1
+        return f"hello {name}"
+
+    async with Runtime() as rt:
+        assert await greet("world") == "hello world"
+        assert await greet("world") == "hello world"
+        assert call_count == 2
+
+
+# ── Handle passing and dependency resolution ──
+
+
+@pytest.mark.asyncio
+async def test_handle_as_argument():
+    """A Handle passed to another step is resolved before calling the body."""
+
+    @step
+    async def double(x: int) -> int:
+        return x * 2
+
+    @step
+    async def add_one(x: int) -> int:
+        return x + 1
+
+    async with Runtime() as rt:
+        h = double(5)             # Handle[int]
+        result = await add_one(h)  # framework awaits h, passes 10
+        assert result == 11
+
+
+@pytest.mark.asyncio
+async def test_chained_handles():
+    """Handles can be chained through multiple steps."""
+
+    @step
+    async def step_a(x: int) -> int:
+        return x + 1
+
+    @step
+    async def step_b(x: int) -> int:
+        return x * 2
+
+    @step
+    async def step_c(x: int) -> int:
+        return x - 3
+
+    async with Runtime() as rt:
+        result = await step_c(step_b(step_a(10)))
+        assert result == 19  # (10+1)*2 - 3
+
+
+# ── Fan-out / fan-in ──
+
+
+@pytest.mark.asyncio
+async def test_fanout():
+    """Multiple steps run concurrently when handles aren't immediately awaited."""
+    execution_order = []
+
+    @step
+    async def slow(x: int) -> int:
+        execution_order.append(f"start-{x}")
+        await asyncio.sleep(0.01)
+        execution_order.append(f"end-{x}")
+        return x * 2
+
+    async with Runtime() as rt:
+        handles = [slow(i) for i in range(3)]
+        results = [await h for h in handles]
+        assert results == [0, 2, 4]
+
+        # All started before any ended (concurrent execution)
+        starts = [i for i, e in enumerate(execution_order) if e.startswith("start")]
+        ends = [i for i, e in enumerate(execution_order) if e.startswith("end")]
+        assert max(starts) < min(ends)
+
+
+@pytest.mark.asyncio
+async def test_fanout_with_dependentstep():
+    """Fan-out results can be passed as handles to a downstream step."""
+
+    @step
+    async def double(x: int) -> int:
+        return x * 2
+
+    @step
+    async def sum_two(a: int, b: int) -> int:
+        return a + b
+
+    async with Runtime() as rt:
+        h1 = double(3)
+        h2 = double(4)
+        result = await sum_two(h1, h2)
+        assert result == 14  # 6 + 8
+
+
+# ── Trace events ──
+
+
+@pytest.mark.asyncio
+async def test_trace_emits_event():
+    """trace() emits an event visible in the runtime trace log."""
+
+    @step
+    async def work() -> str:
+        trace("starting work")
+        trace("halfway", progress=(1, 2))
+        return "done"
+
+    async with Runtime() as rt:
+        await work()
+        trace_events = rt.trace.events(kind="trace")
+        assert len(trace_events) == 2
+        assert trace_events[0].message == "starting work"
+        assert trace_events[1].message == "halfway"
+        assert trace_events[1].kwargs["progress"] == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_trace_has_correct_parent():
+    """trace() events are associated with the step they're called from."""
+
+    @step
+    async def outer() -> str:
+        trace("in outer")
+        await inner()
+        return "done"
+
+    @step
+    async def inner() -> str:
+        trace("in inner")
+        return "done"
+
+    async with Runtime() as rt:
+        await outer()
+        traces = rt.trace.events(kind="trace")
+        outer_span = rt.trace.span("outer")
+        inner_span = rt.trace.span("inner")
+        assert traces[0].parent_id == outer_span.id
+        assert traces[1].parent_id == inner_span.id
+
+
+# ── Event log structure ──
+
+
+@pytest.mark.asyncio
+async def test_spawn_and_join_events():
+    """Handle creation emits spawn; awaiting emits join."""
+
+    @step
+    async def child() -> int:
+        return 42
+
+    @step
+    async def parent() -> int:
+        h = child()
+        return await h
+
+    async with Runtime() as rt:
+        await parent()
+        spawns = rt.trace.events(kind="spawn")
+        joins = rt.trace.events(kind="join")
+
+        # parent spawns, child spawns (from parent)
+        assert len(spawns) == 2
+        # child is joined by parent
+        child_joins = [j for j in joins if rt.trace.span_name(j.id) == "child"]
+        assert len(child_joins) == 1
+
+
+@pytest.mark.asyncio
+async def test_fanout_detected_in_trace():
+    """Multiple spawns without intervening joins constitute a fan-out."""
+
+    @step
+    async def leaf(x: int) -> int:
+        return x
+
+    @step
+    async def root() -> list[int]:
+        handles = [leaf(i) for i in range(5)]
+        return [await h for h in handles]
+
+    async with Runtime() as rt:
+        await root()
+        root_span = rt.trace.span("root")
+        child_spawns = rt.trace.child_events(root_span.id, kind="spawn")
+        child_joins = rt.trace.child_events(root_span.id, kind="join")
+
+        # 5 spawns happened before any joins
+        assert len(child_spawns) == 5
+        assert len(child_joins) == 5
+        assert child_spawns[-1].ts < child_joins[0].ts
+
+
+# ── Cached output and tracing ──
+
+
+@pytest.mark.asyncio
+async def test_cached_output_available_in_memo_false():
+    """cached_output() returns previous result when memo=False."""
+
+    @step(memo=False)
+    async def compute(x: int) -> int:
+        prev = cached_output()
+        if prev is not None:
+            return prev + 100  # modify to prove we got it
+        return x * 2
+
+    async with Runtime() as rt:
+        assert await compute(5) == 10       # first: no cache, returns 5*2
+        assert await compute(5) == 110      # second: cached_output() returns 10, adds 100
+
+
+@pytest.mark.asyncio
+async def test_cached_tracing_replays_traces():
+    """cached_tracing() returns trace events from the previous execution."""
+
+    @step(memo=False)
+    async def work(x: int) -> int:
+        prev_traces = cached_tracing()
+        if prev_traces is not None:
+            for t in prev_traces:
+                trace(f"replayed: {t.message}", **t.kwargs)
+            return cached_output()
+        trace("doing work", step=1)
+        trace("almost done", step=2)
+        return x * 2
+
+    async with Runtime() as rt:
+        assert await work(5) == 10
+
+        # Second call — should replay traces
+        assert await work(5) == 10
+        all_traces = rt.trace.events(kind="trace")
+        replayed = [t for t in all_traces if t.message.startswith("replayed")]
+        assert len(replayed) == 2
+        assert replayed[0].message == "replayed: doing work"
+        assert replayed[1].message == "replayed: almost done"
+
+
+# ── Error handling ──
+
+
+@pytest.mark.asyncio
+async def test_error_propagates_through_handle():
+    """An error in a step propagates when the handle is awaited."""
+
+    @step
+    async def fail() -> str:
+        raise ValueError("boom")
+
+    async with Runtime() as rt:
+        h = fail()
+        with pytest.raises(ValueError, match="boom"):
+            await h
+
+
+@pytest.mark.asyncio
+async def test_error_cached_but_retried():
+    """Errors are stored (for browsing) but re-executed on next run."""
+    call_count = 0
+
+    @step(memo=True)
+    async def flaky() -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ValueError("first call fails")
+        return "success"
+
+    async with Runtime() as rt:
+        h = flaky()
+        with pytest.raises(ValueError):
+            await h
+        assert call_count == 1
+
+        # Second call — error is not returned from cache, function runs again
+        assert await flaky() == "success"
+        assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_error_in_child_propagates_to_parent():
+    """A child step's error propagates to the parent when awaited."""
+
+    @step
+    async def bad_child() -> str:
+        raise RuntimeError("child failed")
+
+    @step
+    async def parent() -> str:
+        h = bad_child()
+        return await h
+
+    async with Runtime() as rt:
+        with pytest.raises(RuntimeError, match="child failed"):
+            await parent()
+
+
+# ── Structured concurrency / task groups ──
+
+
+@pytest.mark.asyncio
+async def test_parent_waits_for_unawaited_children():
+    """Parent span doesn't close until all children (even unawaited) complete."""
+    child_completed = False
+
+    @step
+    async def slow_child() -> int:
+        nonlocal child_completed
+        await asyncio.sleep(0.05)
+        child_completed = True
+        return 42
+
+    @step
+    async def parent() -> str:
+        slow_child()  # spawned but not awaited
+        return "done"
+
+    async with Runtime() as rt:
+        result = await parent()
+        assert result == "done"
+        assert child_completed  # parent waited for child via task group
+
+        parent_span = rt.trace.span("parent")
+        child_span = rt.trace.span("slow_child")
+        assert child_span.end_ts <= parent_span.end_ts
+
+
+# ── Identity and version ──
+
+
+@pytest.mark.asyncio
+async def test_custom_identity():
+    """Custom identity overrides the default."""
+
+    @step(identity="my_custom_id")
+    async def foo() -> str:
+        return "bar"
+
+    async with Runtime() as rt:
+        await foo()
+        span = rt.trace.span("foo")
+        assert span.identity == "my_custom_id"
+
+
+@pytest.mark.asyncio
+async def test_version_change_invalidates_cache():
+    """Changing the version causes a cache miss even with same args."""
+    call_count = 0
+
+    @step(memo=True, version="v1")
+    async def compute(x: int) -> int:
+        nonlocal call_count
+        call_count += 1
+        return x * 2
+
+    async with Runtime() as rt:
+        assert await compute(5) == 10
+        assert call_count == 1
+
+        # "Upgrade" to v2 — should cache miss
+        compute_v2 = step(compute.__wrapped__, memo=True, version="v2")
+        assert await compute_v2(5) == 10
+        assert call_count == 2
+
+
+# ── Edge annotations ──
+
+
+@pytest.mark.asyncio
+async def test_edge_annotation():
+    """trace(edge=True) annotates the transition between child steps."""
+
+    @step
+    async def step_a() -> str:
+        return "a"
+
+    @step
+    async def step_b() -> str:
+        return "b"
+
+    @step
+    async def parent() -> str:
+        await step_a()
+        trace("transition", edge=True, reason="moving on")
+        await step_b()
+        return "done"
+
+    async with Runtime() as rt:
+        await parent()
+        edges = rt.trace.edge_annotations("parent")
+        assert len(edges) == 1
+        assert edges[0].message == "transition"
+        assert edges[0].kwargs["reason"] == "moving on"
+
+
+# ── Hash funcs registry ──
+
+
+@pytest.mark.asyncio
+async def test_custom_hash_func():
+    """Custom hash_funcs are used for cache key computation."""
+    from pathlib import Path
+
+    call_count = 0
+
+    async with Runtime(hash_funcs={Path: lambda p: str(p)}) as rt:
+
+        @step(memo=True)
+        async def read_file(path: Path) -> str:
+            nonlocal call_count
+            call_count += 1
+            return f"contents of {path}"
+
+        assert await read_file(Path("/tmp/a.txt")) == "contents of /tmp/a.txt"
+        assert await read_file(Path("/tmp/a.txt")) == "contents of /tmp/a.txt"
+        assert call_count == 1  # cached
+
+        assert await read_file(Path("/tmp/b.txt")) == "contents of /tmp/b.txt"
+        assert call_count == 2  # different path, cache miss
+
+
+# ── Higher-order wrappers ──
+
+
+@pytest.mark.asyncio
+async def test_replayable_wrapper():
+    """replayable() replays from cache with trace events when available."""
+    from cairn.patterns import replayable
+
+    call_count = 0
+
+    async def compute_impl(x: int) -> int:
+        nonlocal call_count
+        call_count += 1
+        trace("computing")
+        await asyncio.sleep(0.01)
+        return x * 2
+
+    compute = replayable(compute_impl)
+
+    async with Runtime() as rt:
+        # First call: runs the real function
+        assert await compute(5) == 10
+        assert call_count == 1
+
+        # Second call: replays from cache
+        assert await compute(5) == 10
+        assert call_count == 1  # not called again
+
+        # Trace events were replayed
+        traces = rt.trace.events(kind="trace")
+        computing_traces = [t for t in traces if "computing" in t.message]
+        assert len(computing_traces) >= 2  # original + replayed
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_wrapper():
+    """rate_limited() constrains concurrent execution."""
+    from cairn.patterns import rate_limited
+
+    max_concurrent = 0
+    current_concurrent = 0
+
+    @rate_limited(2)
+    async def limited(x: int) -> int:
+        nonlocal max_concurrent, current_concurrent
+        current_concurrent += 1
+        max_concurrent = max(max_concurrent, current_concurrent)
+        await asyncio.sleep(0.05)
+        current_concurrent -= 1
+        return x
+
+    async with Runtime() as rt:
+        handles = [limited(i) for i in range(10)]
+        results = [await h for h in handles]
+        assert results == list(range(10))
+        assert max_concurrent <= 2
+
+
+# ── Integration: full pipeline ──
+
+
+@pytest.mark.asyncio
+async def test_research_pipeline():
+    """End-to-end test of a research pipeline with retry loop."""
+
+    @step(memo=True)  # leaf
+    async def research(subject: str) -> str:
+        return f"report on {subject}"
+
+    @step(memo=True)  # leaf
+    async def validate(report: str) -> dict:
+        if "detailed" in report:
+            return {"success": True, "feedback": None}
+        return {"success": False, "feedback": "needs detail"}
+
+    @step(memo=True)  # leaf
+    async def refine(draft: str, feedback: str) -> str:
+        return f"detailed {draft}"
+
+    @step  # orchestration
+    async def research_validated(subject: str) -> str:
+        draft = await research(subject)
+        for i in range(3):
+            result = await validate(draft)
+            if result["success"]:
+                return draft
+            trace("retrying", edge=True)
+            draft = await refine(draft, result["feedback"])
+        return draft
+
+    @step
+    async def pipeline() -> dict[str, str]:
+        animals = ["cat", "dog", "elephant"]
+        handles = {a: research_validated(a) for a in animals}
+        return {a: await h for a, h in handles.items()}
+
+    async with Runtime() as rt:
+        results = await pipeline()
+        assert len(results) == 3
+        assert all("detailed" in r for r in results.values())
+
+        # Rerun — everything cached
+        call_counts_before = rt.trace.total_executions()
+        results2 = await pipeline()
+        call_counts_after = rt.trace.total_executions()
+        assert results2 == results
+        # Only pipeline + 3 research_validated + inner steps should be cached
+        # No new real executions
+        assert rt.trace.cached_count() > 0

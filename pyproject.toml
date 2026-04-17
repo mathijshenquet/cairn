@@ -1,0 +1,38 @@
+[project]
+name = "cairn"
+version = "0.1.0"
+description = "Compute graph orchestration with caching and observability"
+requires-python = ">=3.12"
+dependencies = [
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+pydantic = ["pydantic>=2.0"]
+tui = ["textual>=3.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25.0",
+    "textual>=3.0",
+]
+
+[project.scripts]
+cairn = "cairn.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cairn"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+venvPath = ".devenv/state"
+venv = "venv"
+exclude = ["src/cairn/tui.py"]

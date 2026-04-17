@@ -1,0 +1,6 @@
+**/.devenv
+.pytest_cache
+.claude
+**/__pycache__/
+.cairn/
+.env
