@@ -114,7 +114,7 @@ def test_gc_outputs(tmp_path: Path) -> None:
     remove_run(store_path, runs[1].run_id)
 
     # GC outputs
-    from cairn.gc import gc_outputs
+    from cairn.run import gc_outputs
     removed = gc_outputs(store_path)
 
     outputs_after = set(os.listdir(outputs_dir))
@@ -171,7 +171,7 @@ def test_gc_with_shared_outputs(tmp_path: Path) -> None:
     remove_run(store_path, runs[0].run_id)
 
     # GC — output should NOT be removed (still referenced by run 2)
-    from cairn.gc import gc_outputs
+    from cairn.run import gc_outputs
     removed = gc_outputs(store_path)
 
     # The shared output should still exist

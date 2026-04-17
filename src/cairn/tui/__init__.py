@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import os
 import time
@@ -14,14 +16,12 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
-from textual.widgets import Footer, Header, Static
+from textual.widgets import Footer, Header, Input, Static
 from textual.widgets import Tree as TextualTree
 
-from cairn.context import Event, set_sink
-from cairn.core import Handle, set_store
-from cairn.gc import RunInfo, list_runs
-from cairn.run import CompositeSink, RunManager, SymlinkTracker
-from cairn.sink import event_to_dict
+from cairn.core import Event, Handle, event_to_dict, set_sink, set_store
+from cairn.interaction import InputRequest, set_interaction_sink
+from cairn.run import CompositeSink, RunInfo, RunManager, SymlinkTracker, list_runs
 
 
 # ── Messages for pipeline events ──
@@ -42,6 +42,15 @@ class PipelineDone(Message):
         self.error = error
 
 
+class InputRequestMessage(Message):
+    """Pipeline is asking for input — routed from worker thread."""
+
+    def __init__(self, req: InputRequest, fut: concurrent.futures.Future[Any]) -> None:
+        super().__init__()
+        self.req = req
+        self.fut = fut
+
+
 # ── Thread-safe sink that posts to Textual ──
 
 
@@ -55,6 +64,26 @@ class TuiSink:
         event.ts = time.monotonic()
         d = event_to_dict(event)
         self._app.call_from_thread(self._app.post_message, PipelineEvent(d))
+
+
+class TuiInteractionSink:
+    """InteractionSink adapter that routes requests to the Textual app.
+
+    The pipeline worker runs in its own thread + asyncio loop; Textual runs
+    in the main thread. We use a concurrent.futures.Future to bridge: post
+    a message into the app, then `asyncio.wrap_future(fut)` so the worker's
+    await yields until the main thread resolves the future on submit.
+    """
+
+    def __init__(self, app: CairnApp) -> None:
+        self._app = app
+
+    async def request(self, req: InputRequest) -> Any:
+        fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        self._app.call_from_thread(
+            self._app.post_message, InputRequestMessage(req, fut)
+        )
+        return await asyncio.wrap_future(fut)
 
 
 # ── Main app ──
@@ -102,6 +131,7 @@ class CairnApp(App[None]):
         self._current_run_id: str | None = None  # None = selector view
         self._live_active: bool = False
         self._detail_plain: str = ""
+        self._pending_inputs: dict[int, concurrent.futures.Future[Any]] = {}
         self._reset_span_state()
 
     def _update_detail(self, content: "Text | str") -> None:
@@ -500,13 +530,17 @@ class CairnApp(App[None]):
             async def _run() -> Any:
                 store_token = set_store(rm.store)
                 sink_token = set_sink(sink)
+                interaction_token = set_interaction_sink(TuiInteractionSink(self))
                 try:
                     handle = entry_fn()
                     return await handle
                 finally:
-                    from cairn import context, core
-                    core._store.reset(store_token)  # type: ignore[attr-defined]
-                    context._sink.reset(sink_token)  # type: ignore[attr-defined]
+                    from cairn.core import reset_sink, reset_store
+                    from cairn.interaction import reset_interaction_sink
+
+                    reset_interaction_sink(interaction_token)
+                    reset_store(store_token)
+                    reset_sink(sink_token)
                     rm.close()
 
             try:
@@ -541,6 +575,32 @@ class CairnApp(App[None]):
         if self._detail_plain:
             self.copy_to_clipboard(self._detail_plain)
             self.notify("Detail copied to clipboard")
+
+    # ── Interaction sink wiring ──
+
+    @on(InputRequestMessage)
+    def on_input_request(self, msg: InputRequestMessage) -> None:
+        """Mount an Input widget in the detail pane for the pending request."""
+        self._pending_inputs[msg.req.id] = msg.fut
+        scroll = self.query_one("#detail-scroll", VerticalScroll)
+        placeholder = msg.req.metadata.get("placeholder") if msg.req.metadata else None
+        widget = Input(
+            placeholder=str(placeholder) if placeholder else msg.req.prompt,
+            id=f"input-{msg.req.id}",
+        )
+        scroll.mount(widget)
+        widget.focus()
+
+    @on(Input.Submitted)
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        widget_id = event.input.id
+        if not widget_id or not widget_id.startswith("input-"):
+            return
+        req_id = int(widget_id[len("input-"):])
+        fut = self._pending_inputs.pop(req_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(event.value)
+        event.input.remove()
 
 
 # ── Entry points ──

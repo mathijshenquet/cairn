@@ -10,10 +10,12 @@ dependencies = [
 [project.optional-dependencies]
 pydantic = ["pydantic>=2.0"]
 tui = ["textual>=3.0"]
+full = ["cairn[tui,pydantic]"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.25.0",
     "textual>=3.0",
+    "import-linter>=2.0",
 ]
 
 [project.scripts]
@@ -35,4 +37,18 @@ pythonVersion = "3.12"
 typeCheckingMode = "strict"
 venvPath = ".devenv/state"
 venv = "venv"
-exclude = ["src/cairn/tui.py"]
+exclude = ["src/cairn/tui/"]
+
+[tool.importlinter]
+root_packages = ["cairn"]
+
+[[tool.importlinter.contracts]]
+name = "Cairn layering"
+type = "layers"
+layers = [
+    "cairn.cli",
+    "cairn.tui",
+    "cairn.run",
+    "cairn.interaction",
+    "cairn.core",
+]

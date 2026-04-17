@@ -7,10 +7,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar
 
-from cairn.context import Event, set_sink
-from cairn.core import Handle, set_store
-from cairn.sink import JSONLSink
-from cairn.store import FileStore
+from cairn.core import Event, FileStore, Handle, JSONLSink, set_sink, set_store
 
 R = TypeVar("R")
 
@@ -164,10 +161,38 @@ def run(
             result: R = await handle
             return result
         finally:
-            from cairn import context, core  # noqa: PLC0415
+            from cairn.core import reset_sink, reset_store  # noqa: PLC0415
 
-            core._store.reset(store_token)  # pyright: ignore[reportPrivateUsage]
-            context._sink.reset(sink_token)  # pyright: ignore[reportPrivateUsage]
+            reset_store(store_token)
+            reset_sink(sink_token)
             rm.close()
 
     return asyncio.run(_run())
+
+
+# Re-export gc + show for the public `cairn.run` surface.
+from .gc import (  # noqa: E402
+    RunInfo,
+    gc,
+    gc_outputs,
+    list_runs,
+    remove_run,
+    remove_runs_before,
+)
+from .show import show_output, show_runs, show_trace  # noqa: E402
+
+__all__ = [
+    "RunManager",
+    "SymlinkTracker",
+    "CompositeSink",
+    "run",
+    "RunInfo",
+    "list_runs",
+    "remove_run",
+    "remove_runs_before",
+    "gc",
+    "gc_outputs",
+    "show_trace",
+    "show_runs",
+    "show_output",
+]

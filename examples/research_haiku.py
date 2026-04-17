@@ -18,7 +18,7 @@ import asyncio
 from datetime import date
 
 from cairn import run, step, trace
-from cairn.patterns import rate_limited
+from cairn import rate_limited
 
 
 # Why no --bare: it forces auth to ANTHROPIC_API_KEY (OAuth/keychain disabled),

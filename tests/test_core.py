@@ -11,7 +11,7 @@ import asyncio
 import pytest
 
 from cairn import step, trace, cached_output, cached_tracing, Handle
-from cairn.testing import Runtime
+from cairn.core.testing import Runtime
 
 
 
@@ -506,7 +506,7 @@ async def test_custom_hash_func():
 @pytest.mark.asyncio
 async def test_replayable_wrapper():
     """replayable() replays from cache with trace events when available."""
-    from cairn.patterns import replayable
+    from cairn import replayable
 
     call_count = 0
 
@@ -537,7 +537,7 @@ async def test_replayable_wrapper():
 @pytest.mark.asyncio
 async def test_rate_limited_wrapper():
     """rate_limited() constrains concurrent execution."""
-    from cairn.patterns import rate_limited
+    from cairn import rate_limited
 
     max_concurrent = 0
     current_concurrent = 0

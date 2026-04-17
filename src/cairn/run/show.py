@@ -13,8 +13,8 @@ import time
 from datetime import datetime
 from typing import Any
 
-from cairn.context import Event
-from cairn.gc import list_runs
+from cairn.core import Event
+from .gc import list_runs
 
 
 # ── ANSI colors ──
@@ -147,7 +147,7 @@ class LiveRenderer:
 
     def emit(self, event: Event) -> None:
         """Sink-compatible emit: convert Event to dict and render."""
-        from cairn.sink import event_to_dict
+        from cairn.core import event_to_dict
         event.ts = time.monotonic()
         self.render_event(event_to_dict(event))
 

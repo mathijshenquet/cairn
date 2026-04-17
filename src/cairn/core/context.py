@@ -8,7 +8,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from cairn.types import TaskSpan
+from .types import TaskSpan
 
 
 # Current span context — set when a step is executing
@@ -89,6 +89,11 @@ def get_sink() -> Sink:
 def set_sink(sink: Sink) -> Token[Sink]:
     """Set the event sink, returning a token for resetting."""
     return _sink.set(sink)
+
+
+def reset_sink(token: Token[Sink]) -> None:
+    """Reset the sink contextvar to its value before `set_sink(...)`."""
+    _sink.reset(token)
 
 
 def emit_event(kind: str, **kwargs: Any) -> Event:

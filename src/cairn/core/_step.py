@@ -7,10 +7,10 @@ import functools
 import inspect
 from typing import Any, Awaitable, Callable, Generator, Generic, ParamSpec, TypeVar, overload
 
-from cairn.context import current_span, emit_event, next_id
-from cairn.hash import compute_cache_key
-from cairn.store import MemoryStore, Store
-from cairn.types import CacheEntry, Identity, TaskSpan, TraceRecord, Version
+from .context import current_span, emit_event, next_id
+from .hash import compute_cache_key
+from .store import MemoryStore, Store
+from .types import CacheEntry, Identity, TaskSpan, TraceRecord, Version
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -31,6 +31,11 @@ def get_store() -> Store:
 def set_store(store: Store) -> Token[Store]:
     """Set the cache store."""
     return _store.set(store)
+
+
+def reset_store(token: Token[Store]) -> None:
+    """Reset the store contextvar to its value before `set_store(...)`."""
+    _store.reset(token)
 
 
 # ── Handle ──

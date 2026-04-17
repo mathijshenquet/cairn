@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from cairn import step, Handle, trace, cached_output, cached_tracing
-from cairn.testing import Runtime
+from cairn.core.testing import Runtime
 
 
 # ── Validated loop (research + validate + refine) ──
@@ -124,7 +124,7 @@ async def test_human_in_the_loop_iteration() -> None:
 @pytest.mark.asyncio
 async def test_replayable_preserves_traces() -> None:
     """Replayable wrapper replays trace events from cache."""
-    from cairn.patterns import replayable
+    from cairn import replayable
 
     call_count = 0
 
@@ -224,7 +224,7 @@ async def test_scraper_pattern() -> None:
 @pytest.mark.asyncio
 async def test_rate_limited_with_fanout() -> None:
     """rate_limited works correctly under fan-out."""
-    from cairn.patterns import rate_limited
+    from cairn import rate_limited
 
     max_concurrent = 0
     current = 0

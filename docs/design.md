@@ -6,7 +6,7 @@ Cairn has five core primitives:
 
 | Primitive | Role |
 |-----------|------|
-| `_step` decorator | Turns an async function into a tracked, cached node in the computation graph |
+| `step` decorator | Turns an async function into a tracked, cached node in the computation graph |
 | `Handle[T]` | Awaitable reference to a running step's result. Enables concurrency and dependency tracking |
 | `trace()` | Formless annotation — emits an atomic event into the trace log |
 | `cached_output()` | Access previous cached result from within a step body |
@@ -18,36 +18,40 @@ Everything else — memoization, replay, rate limiting, retry, human-in-the-loop
 
 ---
 
-## 1. The `_step` decorator
-
-> Name is provisional. Internal name `_step` with `memo=True/False`. Public name TBD.
+## 1. The `@step` decorator
 
 ### Signature
 
 ```python
-def _step(
+def step(
     fn: Callable[P, Awaitable[R]] = None,
     *,
-    memo: bool = True,
+    memo: bool = False,
     identity: str | Identity | Callable[[Any], str | Identity] | None = None,
     version: str | Version | Callable[[Any], str | Version] | None = None,
 ) -> Callable[P, Handle[R]]:
     ...
 ```
 
+### Why `memo=False` by default
+
+`memo=True` means "on cache hit, skip execution entirely and return the stored result." That's the right choice for expensive leaves (LLM calls, heavy computation) but the wrong default for orchestration steps — a memoized step that hits cache doesn't re-execute, which means its child steps never re-spawn, and the computation graph for a rerun looks empty.
+
+The asymmetry: an un-memoed step can reconstruct memoed behavior by calling `cached_output()` early and returning. The inverse isn't possible — a memoed step can never choose to re-run its children for observability. So the less-opinionated default (`memo=False`) is strictly more expressive.
+
 ### Overloads for usage as decorator
 
 ```python
-# bare decorator — memoized, identity/version auto-derived
-@_step
+# bare decorator — always runs, identity/version auto-derived
+@step
 async def foo(x: int) -> int: ...
 
-# decorator with options
-@_step(memo=False)
+# decorator with options — opt into memoization for expensive leaves
+@step(memo=True)
 async def bar(x: int) -> int: ...
 
 # functional form (used by higher-order wrappers)
-wrapped = _step(fn, memo=False, identity=Identity.from_function(original))
+wrapped = step(fn, memo=True, identity=Identity.from_function(original))
 ```
 
 ### What the decorator does
@@ -152,7 +156,7 @@ A Handle is an awaitable reference to a running step's eventual result.
 
 ### Creation
 
-A Handle is returned immediately when a `_step`-decorated function is called. Under the hood it wraps an `asyncio.Task`.
+A Handle is returned immediately when a `step`-decorated function is called. Under the hood it wraps an `asyncio.Task`.
 
 ```python
 h = research("cat", spec)   # returns Handle[str] immediately
@@ -168,7 +172,7 @@ This enables the UI to detect fan-out (multiple spawns without intervening joins
 
 ### Passing Handles as arguments
 
-A Handle can be passed directly to another `_step`-decorated function:
+A Handle can be passed directly to another `step`-decorated function:
 
 ```python
 page = fetch(url)                # Handle[str]
@@ -180,10 +184,10 @@ The receiving function's decorator resolves Handles before calling the body. The
 
 ### Task group and structured concurrency
 
-Each `_step` execution runs within an implicit task group (anyio `TaskGroup`). All child steps spawned within a parent belong to the parent's task group. The parent's span does not close until all children complete.
+Each `step` execution runs within an implicit task group (anyio `TaskGroup`). All child steps spawned within a parent belong to the parent's task group. The parent's span does not close until all children complete.
 
 ```python
-@_step
+@step
 async def parent():
     h1 = child_a()    # spawned in parent's task group
     h2 = child_b()    # spawned in parent's task group
@@ -344,13 +348,13 @@ Since each `asyncio.Task` gets its own contextvars copy, concurrent steps have i
 For this code:
 
 ```python
-@_step
+@step
 async def main():
     handles = [research(a) for a in ["cat", "dog"]]
     for h in handles:
         await h
 
-@_step
+@step
 async def research(subject: str) -> str:
     trace("building prompt")
     return await claude(f"research {subject}")
@@ -468,9 +472,9 @@ Streamlit-style: launches a frontend (if a UI plugin is installed), runs the scr
 
 These are **not** framework builtins. They are user-space functions built from the core primitives. The framework provides the building blocks; users compose them.
 
-### Memoization (default behavior)
+### Memoization (opt-in)
 
-When `memo=True` (default), the decorator auto-short-circuits on cache hit. This is equivalent to:
+When `memo=True`, the decorator auto-short-circuits on cache hit. This is equivalent to:
 
 ```python
 prev = cached_output()
@@ -495,7 +499,7 @@ def replayable(fn: Callable[P, Awaitable[R]]) -> Callable[P, Handle[R]]:
                 trace(t.message, **t.kwargs)
             return prev
         return await fn(*args, **kwargs)
-    return _step(
+    return step(
         wrapper, memo=False,
         identity=Identity.from_function(fn),
         version=Version.from_function(fn),
@@ -515,7 +519,7 @@ def rate_limited(n: int):
             async with sem:
                 trace("acquired slot", status="running")
                 return await fn(*args, **kwargs)
-        return _step(
+        return step(
             wrapper, memo=True,
             identity=Identity.from_function(fn),
             version=Version.from_function(fn),
@@ -538,7 +542,7 @@ def with_retry(max_attempts: int = 3):
                     if attempt == max_attempts - 1:
                         raise
                     trace("retrying", error=str(e))
-        return _step(
+        return step(
             wrapper, memo=True,
             identity=Identity.from_function(fn),
             version=Version.from_function(fn),
@@ -583,7 +587,7 @@ report = await validated(
 Human interaction is just a step that blocks until input arrives via an external harness:
 
 ```python
-@_step(memo=False)
+@step(memo=False)
 async def human_review(question: str, prefill: str | None = None) -> str:
     prev = cached_output()
     return await harness.ask(question, prefill=prev or prefill)
@@ -693,9 +697,9 @@ class Handle(Generic[T]):
         return self._task.done()
 
 
-def _step(fn=None, *, memo=True, identity=None, version=None):
+def step(fn=None, *, memo=False, identity=None, version=None):
     if fn is None:
-        return functools.partial(_step, memo=memo, identity=identity, version=version)
+        return functools.partial(step, memo=memo, identity=identity, version=version)
 
     _identity = identity or Identity.from_function(fn)
     _version = version or Version.from_function(fn)

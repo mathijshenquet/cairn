@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from cairn.context import Event, MemorySink, reset_id_counter, set_sink
+from .context import Event, MemorySink, reset_id_counter, set_sink
 from cairn.core import set_store
-from cairn.hash import clear_hash_funcs, set_hash_funcs
-from cairn.store import MemoryStore
+from .hash import clear_hash_funcs, set_hash_funcs
+from .store import MemoryStore
 
 
 @dataclass
@@ -127,10 +127,11 @@ class Runtime:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        from cairn import context, core  # noqa: PLC0415
+        from ._step import reset_store
+        from .context import reset_sink
 
         if self._store_token is not None:
-            core._store.reset(self._store_token)  # pyright: ignore[reportPrivateUsage]
+            reset_store(self._store_token)
         if self._sink_token is not None:
-            context._sink.reset(self._sink_token)  # pyright: ignore[reportPrivateUsage]
+            reset_sink(self._sink_token)
         clear_hash_funcs()

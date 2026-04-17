@@ -1,11 +1,26 @@
 """Cairn: Compute graph orchestration with caching and observability."""
 
-from cairn.core import Handle, cached_output, cached_tracing, step, trace
-from cairn.gc import gc, list_runs, remove_run, remove_runs_before
-from cairn.hash import register_hash_func
-from cairn.run import run
-from cairn.serial import register_serializer
-from cairn.types import Identity, TraceRecord, Version
+from cairn.core import (
+    Handle,
+    Identity,
+    TraceRecord,
+    Version,
+    cached_output,
+    cached_tracing,
+    rate_limited,
+    register_hash_func,
+    register_serializer,
+    replayable,
+    step,
+    trace,
+)
+from cairn.run import (
+    gc,
+    list_runs,
+    remove_run,
+    remove_runs_before,
+    run,
+)
 
 __all__ = [
     "Handle",
@@ -16,9 +31,11 @@ __all__ = [
     "cached_tracing",
     "gc",
     "list_runs",
+    "rate_limited",
     "register_hash_func",
     "register_serializer",
     "remove_run",
+    "replayable",
     "remove_runs_before",
     "run",
     "step",

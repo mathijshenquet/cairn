@@ -7,7 +7,7 @@ import os
 import time
 from typing import Any
 
-from cairn.context import Event
+from .context import Event
 
 
 def event_to_dict(event: Event) -> dict[str, Any]:

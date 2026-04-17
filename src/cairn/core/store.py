@@ -6,7 +6,7 @@ import json
 import os
 from typing import Any, Protocol
 
-from cairn.types import CacheEntry, TraceRecord
+from .types import CacheEntry, TraceRecord
 
 
 class Store(Protocol):

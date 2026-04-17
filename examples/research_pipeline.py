@@ -11,7 +11,7 @@ import hashlib
 import random
 
 from cairn import step, run, trace
-from cairn.patterns import rate_limited
+from cairn import rate_limited
 
 
 # ── Fake Claude API ──
