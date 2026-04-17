@@ -25,25 +25,37 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeVar
 
-from cairn.core import emit_event, next_id, step
+from cairn.core import cached_output, emit_event, next_id, step
 
 T = TypeVar("T")
+
+
+_SENTINEL = object()
 
 
 @dataclass
 class InputRequest:
     """A single pending request for input.
 
-    `schema` is the expected type — implementations are free to use it as a
-    coercion/validation hint or ignore it. `metadata` is a bag for UI hints
-    (placeholder text, multi-line toggle, allowed values, etc.) that sinks
-    can use without forcing them into the public signature.
+    `default` is a prefill value from a previous run (via `cached_output()`).
+    Sinks should surface it — TUIs as the widget's initial value, CLIs in
+    brackets — so the human can accept by hitting enter or edit to change.
+    `_SENTINEL` means "no prior value" (distinct from `None` as a real prior
+    answer).
+
+    `metadata` is a bag for UI hints (placeholder, multi-line, allowed
+    values, etc.) that sinks can use without forcing them into the public
+    signature.
     """
 
     id: int
     prompt: str
-    schema: type = str
+    default: Any = _SENTINEL
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def has_default(self) -> bool:
+        return self.default is not _SENTINEL
 
 
 class InteractionSink(Protocol):
@@ -74,10 +86,11 @@ def reset_interaction_sink(token: Token[InteractionSink | None]) -> None:
 # ── Primitive ──
 
 
-@step(memo=True)
+@step
 async def _ask(prompt: str, schema_name: str, metadata: dict[str, Any]) -> Any:
-    """Memoized core of `await_input`. Schema is passed as its name so the
-    cache key stays hashable (types aren't hashable by default)."""
+    """Core of `await_input`. Runs every time (memo=False) so the human
+    stays in the loop; `cached_output()` supplies a prefill from the
+    previous run when one exists."""
     sink = _interaction_sink.get()
     if sink is None:
         raise RuntimeError(
@@ -85,7 +98,13 @@ async def _ask(prompt: str, schema_name: str, metadata: dict[str, Any]) -> Any:
             "or pass interaction_sink=... to run()."
         )
 
-    req = InputRequest(id=next_id(), prompt=prompt, metadata=metadata)
+    prior = cached_output()
+    req = InputRequest(
+        id=next_id(),
+        prompt=prompt,
+        default=prior if prior is not None else _SENTINEL,
+        metadata=metadata,
+    )
     emit_event(
         "input_request",
         id=req.id,
@@ -133,13 +152,18 @@ class QueueInteractionSink:
 class StdinInteractionSink:
     """Fallback sink that reads from stdin on a worker thread.
 
-    Only safe for a single concurrent request. Multi-prompt interactive UIs
-    should provide their own sink.
+    Shows a prefill in brackets: `"Favorite colour? [blue]\n> "`. Hitting
+    enter on empty input returns the prefill; typing a value overrides it.
+    Only safe for a single concurrent request.
     """
 
     async def request(self, req: InputRequest) -> Any:
-        prompt = f"{req.prompt}\n> " if not req.prompt.endswith("\n") else req.prompt
-        return await asyncio.to_thread(input, prompt)
+        hint = f" [{req.default}]" if req.has_default else ""
+        prompt = f"{req.prompt.rstrip()}{hint}\n> "
+        answer = await asyncio.to_thread(input, prompt)
+        if not answer and req.has_default:
+            return req.default
+        return answer
 
 
 __all__ = [

@@ -584,7 +584,9 @@ class CairnApp(App[None]):
         self._pending_inputs[msg.req.id] = msg.fut
         scroll = self.query_one("#detail-scroll", VerticalScroll)
         placeholder = msg.req.metadata.get("placeholder") if msg.req.metadata else None
+        prefill = str(msg.req.default) if msg.req.has_default else ""
         widget = Input(
+            value=prefill,
             placeholder=str(placeholder) if placeholder else msg.req.prompt,
             id=f"input-{msg.req.id}",
         )
