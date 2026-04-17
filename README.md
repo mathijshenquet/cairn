@@ -49,6 +49,21 @@ Second run is instant — every `@step(memo=True)` result is cached by `(functio
 
 See `examples/` for scrapers, research pipelines, failure/resume, and human-in-the-loop patterns.
 
+## CLI
+
+Cairn ships a `cairn` command for locally running scripts and browsing cached runs.
+
+```sh
+cairn examples/research_haiku.py          # run the pipeline (opens TUI if installed)
+cairn examples/research_haiku.py --force  # clear this entry point's cache, then run
+cairn                                     # interactive browser over past runs
+cairn gc [--before YYYY-MM-DD]            # garbage-collect old runs
+```
+
+By default the store lives at `./.cairn/`. Override with `--store PATH` (or `-s`).
+
+A script's entry point defaults to a function named `main`; pass a second positional arg to pick another (e.g. `cairn script.py my_pipeline`). The `examples/research_haiku.py` example aliases `main = pipeline`, so `cairn examples/research_haiku.py` runs the full research pipeline — the first run hits the Claude CLI, subsequent runs in the same ISO week are fully cached.
+
 ## Docs
 
 - [`docs/motivation.md`](docs/motivation.md) — why this exists, what problem it solves
