@@ -22,6 +22,46 @@ from textual.widgets import Tree as TextualTree
 from cairn.core import Event, Handle, event_to_dict, set_sink, set_store
 from cairn.interaction import InputRequest, set_interaction_sink
 from cairn.run import CompositeSink, RunInfo, RunManager, SymlinkTracker, list_runs
+from cairn.run.show import TRACE_RESERVED, format_cost
+
+
+def _trace_style(level: str) -> str:
+    if level == "error":
+        return "red"
+    if level == "warn":
+        return "yellow"
+    return "dim"
+
+
+def _render_trace_text(e: dict[str, Any]) -> Text:
+    """Render a trace event to a styled Text based on blessed kwargs."""
+    msg: str = e.get("msg", "")
+    level: str = e.get("level", "info")
+    state: str | None = e.get("state")
+    progress: list[int] | None = e.get("progress")
+    cost: dict[str, Any] | None = e.get("cost")
+
+    parts: list[str] = []
+    if progress:
+        cur, total = progress[0], progress[1]
+        filled = int(10 * cur / total) if total else 0
+        bar = "█" * filled + "░" * (10 - filled)
+        parts.append(f"[{bar}]")
+    if msg:
+        parts.append(msg)
+    if progress:
+        parts.append(f"({progress[0]}/{progress[1]})")
+    if state:
+        parts.append(f"[{state}]")
+    if cost:
+        parts.append(format_cost(cost))
+
+    attrs = {k: v for k, v in e.items() if k not in TRACE_RESERVED}
+    if attrs:
+        kv = " ".join(f"{k}={v}" for k, v in attrs.items())
+        parts.append(f"({kv})")
+
+    return Text(" ".join(parts), style=_trace_style(level))
 
 
 # ── Messages for pipeline events ──
@@ -339,8 +379,6 @@ class CairnApp(App[None]):
         elif kind == "trace":
             parent_id = e.get("parent", 0)
             msg_text = e.get("msg", "")
-            if not msg_text:
-                return
 
             if parent_id in self.span_traces:
                 self.span_traces[parent_id].append({"msg": msg_text, "ts": ts, **e})
@@ -349,18 +387,9 @@ class CairnApp(App[None]):
             if parent_node is None:
                 return
 
-            display = Text()
-            if e.get("progress"):
-                cur, total = e["progress"][0], e["progress"][1]
-                filled = int(10 * cur / total)
-                display.append(
-                    f"[{'█' * filled}{'░' * (10 - filled)}] {msg_text} ({cur}/{total})",
-                    style="dim",
-                )
-            else:
-                display.append(msg_text, style="dim")
-
-            parent_node.add(display, data=f"span:{parent_id}", allow_expand=False)
+            display = _render_trace_text(e)
+            if display.plain:
+                parent_node.add(display, data=f"span:{parent_id}", allow_expand=False)
 
         # Refresh detail if the event's subject (the span itself, or for
         # traces its parent) is the highlighted span — or a direct child of it.
@@ -400,6 +429,21 @@ class CairnApp(App[None]):
             return f"{seconds * 1000:.0f}ms"
         return f"{seconds:.1f}s"
 
+    def _rolled_cost(self, span_id: int) -> dict[str, float]:
+        """Sum `cost` columns over this span's traces + all descendants."""
+        total: dict[str, float] = {}
+        for t in self.span_traces.get(span_id, []):
+            cost = t.get("cost")
+            if isinstance(cost, dict):
+                for k, v in cost.items():
+                    if isinstance(v, (int, float)):
+                        total[k] = total.get(k, 0) + v
+        for child_id, parent_id in self.span_parents.items():
+            if parent_id == span_id:
+                for k, v in self._rolled_cost(child_id).items():
+                    total[k] = total.get(k, 0) + v
+        return total
+
     def _refresh_detail(self, span_id: int) -> None:
         status = self.span_status.get(span_id, "pending")
 
@@ -432,17 +476,18 @@ class CairnApp(App[None]):
                 out.append("Result: ", style="bold")
                 out.append(f"{result_str}\n\n")
 
+        # Rolled-up cost (this span's traces + all descendants)
+        rolled = self._rolled_cost(span_id)
+        if rolled:
+            out.append("Cost: ", style="bold")
+            out.append(format_cost(rolled) + "\n\n", style="dim")
+
         # Timeline: traces + each child's start and terminal events
         timeline: list[tuple[float, Text]] = []
 
-        last_progress = ""
         for t in self.span_traces.get(span_id, []):
             ts = t.get("ts", 0.0)
-            msg = t.get("msg", "")
-            progress = t.get("progress")
-            if progress:
-                last_progress = f" ({progress[0]}/{progress[1]})"
-            entry = Text(f"{msg}{last_progress}", style="dim")
+            entry = _render_trace_text(t)
             timeline.append((ts, entry))
 
         children = [sid for sid, pid in self.span_parents.items() if pid == span_id]
@@ -468,6 +513,19 @@ class CairnApp(App[None]):
                 out.append(f"  {elapsed:7.3f}s ")
                 out.append(entry)
                 out.append("\n")
+
+        # Trace details (markdown blobs) shown after the timeline
+        traces_with_detail = [
+            t for t in self.span_traces.get(span_id, []) if t.get("detail")
+        ]
+        if traces_with_detail:
+            out.append("\n")
+            for t in traces_with_detail:
+                msg = t.get("msg", "")
+                detail = str(t.get("detail", ""))
+                out.append(f"▸ {msg}\n", style="bold dim")
+                for line in detail.splitlines() or [detail]:
+                    out.append(f"    {line}\n", style="dim")
 
         self._update_detail(out)
 

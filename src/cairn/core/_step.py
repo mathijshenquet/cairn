@@ -86,17 +86,33 @@ class Handle(Generic[R]):
 # ── trace() ──
 
 
-def trace(message: str, **kwargs: Any) -> None:
-    """Emit a formless trace annotation."""
+def trace(message: str, detail: str = "", **kwargs: Any) -> None:
+    """Emit a trace annotation on the current span.
+
+    `message` is the short label shown on the timeline. `detail` is optional
+    markdown-shaped text shown when the trace is selected.
+
+    Blessed kwargs (known to renderers and aggregators):
+      progress: tuple[int, int] — (current, total), renders as a bar
+      state:    str             — sub-lifecycle tag ("waiting", "retrying", …)
+      level:    "info"|"warn"|"error" — severity; default "info"
+      cost:     dict[str, int | float] — numeric columns summed up the span
+                tree, e.g. {"tokens_in": 10, "tokens_out": 40, "cost_usd": 0.03}
+
+    Any other kwargs are preserved in trace.jsonl and rendered generically.
+    """
     parent = current_span.get()
+    merged = dict(kwargs)
+    if detail:
+        merged["detail"] = detail
     emit_event(
         "trace",
         parent_id=parent.id if parent else None,
         message=message,
-        kwargs=kwargs,
+        kwargs=merged,
     )
     if parent is not None:
-        parent.record_trace(message, kwargs)
+        parent.record_trace(message, merged)
 
 
 # ── cached_output() / cached_tracing() ──

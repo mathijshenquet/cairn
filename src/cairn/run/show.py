@@ -34,6 +34,67 @@ def _color(text: str, color: str) -> str:
     return f"{color}{text}{_RESET}"
 
 
+# Keys that are rendered specially or are part of the core event envelope.
+# Anything else in a trace event is shown as a generic `(k=v)` attr.
+TRACE_RESERVED = frozenset({
+    "e", "ts", "id", "parent", "name", "cached", "err", "by",
+    "msg", "detail", "progress", "state", "level", "cost",
+})
+
+
+def format_cost(cost: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for k, v in cost.items():
+        if isinstance(v, float):
+            parts.append(f"{k}={v:g}")
+        else:
+            parts.append(f"{k}={v}")
+    return "{" + " ".join(parts) + "}"
+
+
+def _format_trace(e: dict[str, Any]) -> tuple[str, str]:
+    """Format a trace event dict. Returns (line, ansi_color_prefix)."""
+    msg: str = e.get("msg", "")
+    level: str = e.get("level", "info")
+    state: str | None = e.get("state")
+    progress: list[int] | None = e.get("progress")
+    cost: dict[str, Any] | None = e.get("cost")
+
+    parts: list[str] = []
+
+    if progress:
+        cur, total = progress[0], progress[1]
+        bar_width = 10
+        filled = int(bar_width * cur / total) if total else 0
+        bar = "█" * filled + "░" * (bar_width - filled)
+        parts.append(f"[{bar}]")
+
+    if msg:
+        parts.append(msg)
+
+    if progress:
+        parts.append(f"({progress[0]}/{progress[1]})")
+    if state:
+        parts.append(f"[{state}]")
+    if cost:
+        parts.append(format_cost(cost))
+
+    attrs = {k: v for k, v in e.items() if k not in TRACE_RESERVED}
+    if attrs:
+        kv = " ".join(f"{k}={v}" for k, v in attrs.items())
+        parts.append(f"({kv})")
+
+    line = " ".join(parts)
+
+    if level == "error":
+        color = _RED
+    elif level == "warn":
+        color = _YELLOW
+    else:
+        color = _DIM
+    return line, color
+
+
 # ── Live renderer — formats events as they arrive ──
 
 
@@ -129,21 +190,8 @@ class LiveRenderer:
             parent_id: int = e.get("parent", 0)
             d = self._depth(parent_id) + 1 if parent_id in self._parents else 1
             indent = "  " * d
-            msg: str = e.get("msg", "")
-            progress: list[int] | None = e.get("progress")
-            edge: bool = e.get("edge", False)
-
-            if edge:
-                icon = _color("→", _MAGENTA)
-                self._print(f"  {relative_ts:8.3f}s {indent}{icon} {_color(msg, _MAGENTA)}")
-            elif progress:
-                cur, total = progress[0], progress[1]
-                bar_width = 10
-                filled = int(bar_width * cur / total)
-                bar = "█" * filled + "░" * (bar_width - filled)
-                self._print(f"  {relative_ts:8.3f}s {indent}{_DIM}[{bar}] {msg} ({cur}/{total}){_RESET}")
-            else:
-                self._print(f"  {relative_ts:8.3f}s {indent}{_DIM}{msg}{_RESET}")
+            line, style_color = _format_trace(e)
+            self._print(f"  {relative_ts:8.3f}s {indent}{style_color}{line}{_RESET}")
 
     def emit(self, event: Event) -> None:
         """Sink-compatible emit: convert Event to dict and render."""
