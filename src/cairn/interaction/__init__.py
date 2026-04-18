@@ -25,7 +25,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeVar
 
-from cairn.core import cached_output, emit_event, next_id, step
+from cairn.core import cached_output, emit_event, next_id, step, trace
 
 T = TypeVar("T")
 
@@ -111,7 +111,9 @@ async def _ask(prompt: str, schema_name: str, metadata: dict[str, Any]) -> Any:
         message=prompt,
         kwargs={"schema": schema_name, **metadata},
     )
+    trace("awaiting input", detail=prompt, state="awaiting")
     response = await sink.request(req)
+    trace("input received", state="done")
     emit_event("input_response", id=req.id)
     return response
 

@@ -13,6 +13,7 @@ Run headless (stdin fallback):
 """
 
 from __future__ import annotations
+import asyncio
 
 from cairn import run, step, trace
 from cairn.interaction import await_input
@@ -21,20 +22,24 @@ from cairn.interaction import await_input
 @step
 async def greet() -> str:
     name = await await_input("What's your name?")
-    trace("got name", name=name)
-    return f"Hello, {name}!"
+    trace("Hello, {name}!")
+    return name
 
 
 @step
-async def ask_color() -> str:
-    return await await_input("Favorite color?")
+async def ask(thing: str) -> str:
+    return await await_input(f"Favorite {thing}?")
 
 
 @step
-async def pipeline() -> dict[str, str]:
-    greeting = await greet()
-    color = await ask_color()
-    return {"greeting": greeting, "color": color}
+async def pipeline() -> str:
+    name = await greet()
+
+    favorites_ = {thing: ask(thing) for thing in ["color", "food"]}
+
+    favorites = {thing: await fav for thing, fav in favorites_.items()}
+
+    return "{name} likes {color} {food}'s".format(name=name, **favorites)
 
 
 main = pipeline

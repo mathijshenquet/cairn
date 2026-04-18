@@ -86,7 +86,9 @@ def _format_trace(e: dict[str, Any]) -> tuple[str, str]:
 
     line = " ".join(parts)
 
-    if level == "error":
+    if state == "awaiting":
+        color = _CYAN
+    elif level == "error":
         color = _RED
     elif level == "warn":
         color = _YELLOW

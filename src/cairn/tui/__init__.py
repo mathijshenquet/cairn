@@ -25,7 +25,9 @@ from cairn.run import CompositeSink, RunInfo, RunManager, SymlinkTracker, list_r
 from cairn.run.show import TRACE_RESERVED, format_cost
 
 
-def _trace_style(level: str) -> str:
+def _trace_style(level: str, state: str | None = None) -> str:
+    if state == "awaiting":
+        return "bold cyan"
     if level == "error":
         return "red"
     if level == "warn":
@@ -61,7 +63,7 @@ def _render_trace_text(e: dict[str, Any]) -> Text:
         kv = " ".join(f"{k}={v}" for k, v in attrs.items())
         parts.append(f"({kv})")
 
-    return Text(" ".join(parts), style=_trace_style(level))
+    return Text(" ".join(parts), style=_trace_style(level, state))
 
 
 # ── Messages for pipeline events ──
@@ -85,10 +87,16 @@ class PipelineDone(Message):
 class InputRequestMessage(Message):
     """Pipeline is asking for input — routed from worker thread."""
 
-    def __init__(self, req: InputRequest, fut: concurrent.futures.Future[Any]) -> None:
+    def __init__(
+        self,
+        req: InputRequest,
+        fut: concurrent.futures.Future[Any],
+        span_id: int | None,
+    ) -> None:
         super().__init__()
         self.req = req
         self.fut = fut
+        self.span_id = span_id
 
 
 # ── Thread-safe sink that posts to Textual ──
@@ -119,9 +127,13 @@ class TuiInteractionSink:
         self._app = app
 
     async def request(self, req: InputRequest) -> Any:
+        from cairn.core.context import current_span
+
+        span = current_span.get()
+        span_id = span.id if span is not None else None
         fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
         self._app.call_from_thread(
-            self._app.post_message, InputRequestMessage(req, fut)
+            self._app.post_message, InputRequestMessage(req, fut, span_id)
         )
         return await asyncio.wrap_future(fut)
 
@@ -172,6 +184,8 @@ class CairnApp(App[None]):
         self._live_active: bool = False
         self._detail_plain: str = ""
         self._pending_inputs: dict[int, concurrent.futures.Future[Any]] = {}
+        # span_id → the Input widget awaiting response on that span
+        self._pending_input_widgets: dict[int, Input] = {}
         self._reset_span_state()
 
     def _update_detail(self, content: "Text | str") -> None:
@@ -182,10 +196,11 @@ class CairnApp(App[None]):
         else:
             self._detail_plain = Text.from_markup(content).plain
 
-    # status ∈ {"pending", "running", "cached", "ok", "error", "cancelled"}
+    # status ∈ {"pending", "running", "awaiting", "cached", "ok", "error", "cancelled"}
     STATUS_ICONS: dict[str, tuple[str, str]] = {
         "pending": ("○", "dim"),
         "running": ("◉", "yellow"),
+        "awaiting": ("◐", "bold cyan"),
         "cached": ("⚡", "green"),
         "ok": ("✓", "green"),
         "error": ("✗", "red"),
@@ -208,6 +223,10 @@ class CairnApp(App[None]):
         self.span_errors: dict[int, str] = {}
         self.span_memo: set[int] = set()
         self.highlighted_span: int | None = None
+        # When the user navigates onto a specific trace node, remember which
+        # trace to expand in the detail pane. Otherwise (span-level select),
+        # we default to expanding the virtual "Result" / last-detail trace.
+        self.selected_trace: tuple[int, int] | None = None  # (span_id, trace_idx)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -380,8 +399,10 @@ class CairnApp(App[None]):
             parent_id = e.get("parent", 0)
             msg_text = e.get("msg", "")
 
+            trace_idx: int | None = None
             if parent_id in self.span_traces:
                 self.span_traces[parent_id].append({"msg": msg_text, "ts": ts, **e})
+                trace_idx = len(self.span_traces[parent_id]) - 1
 
             parent_node = self.span_tree_nodes.get(parent_id)
             if parent_node is None:
@@ -389,7 +410,12 @@ class CairnApp(App[None]):
 
             display = _render_trace_text(e)
             if display.plain:
-                parent_node.add(display, data=f"span:{parent_id}", allow_expand=False)
+                node_data = (
+                    f"trace:{parent_id}:{trace_idx}"
+                    if trace_idx is not None
+                    else f"span:{parent_id}"
+                )
+                parent_node.add(display, data=node_data, allow_expand=False)
 
         # Refresh detail if the event's subject (the span itself, or for
         # traces its parent) is the highlighted span — or a direct child of it.
@@ -457,45 +483,57 @@ class CairnApp(App[None]):
         out.append(self._render_label(span_id, suffix))
         out.append("\n\n")
 
-        # Error details (full text, not truncated)
         if status == "error":
             err = self.span_errors.get(span_id, "")
             if err:
                 out.append("Error:\n", style="bold red")
                 out.append(f"{err}\n\n", style="red")
 
-        # Result (if we have a cached output file)
-        cache_key = self.span_cache_keys.get(span_id)
-        if cache_key and status in ("ok", "cached"):
-            output_path = os.path.join(self._store_path, "outputs", f"{cache_key}.json")
-            if os.path.exists(output_path):
-                with open(output_path, "r") as f:
-                    data: dict[str, Any] = json.load(f)
-                result = data.get("result")
-                result_str = result if isinstance(result, str) else json.dumps(result, indent=2)
-                out.append("Result: ", style="bold")
-                out.append(f"{result_str}\n\n")
-
-        # Rolled-up cost (this span's traces + all descendants)
         rolled = self._rolled_cost(span_id)
         if rolled:
             out.append("Cost: ", style="bold")
             out.append(format_cost(rolled) + "\n\n", style="dim")
 
-        # Timeline: traces + each child's start and terminal events
-        timeline: list[tuple[float, Text]] = []
+        traces = self.span_traces.get(span_id, [])
 
-        for t in self.span_traces.get(span_id, []):
+        # Result (from cached output) — acts as the virtual last trace.
+        cache_key = self.span_cache_keys.get(span_id)
+        result_str: str | None = None
+        if cache_key and status in ("ok", "cached"):
+            output_path = os.path.join(self._store_path, "outputs", f"{cache_key}.json")
+            if os.path.exists(output_path):
+                try:
+                    with open(output_path, "r") as f:
+                        data: dict[str, Any] = json.load(f)
+                    result = data.get("result")
+                    result_str = (
+                        result if isinstance(result, str) else json.dumps(result, indent=2)
+                    )
+                except (OSError, json.JSONDecodeError):
+                    result_str = None
+
+        # Which trace (if any) to expand inline. Result is always expanded.
+        selected_trace_idx: int | None = None
+        if self.selected_trace is not None and self.selected_trace[0] == span_id:
+            selected_trace_idx = self.selected_trace[1]
+
+        # Timeline entries: (ts, label, kind, trace_idx_or_None, detail_or_None)
+        timeline: list[tuple[float, Text, str, int | None, str | None]] = []
+
+        for i, t in enumerate(traces):
             ts = t.get("ts", 0.0)
-            entry = _render_trace_text(t)
-            timeline.append((ts, entry))
+            label = _render_trace_text(t)
+            detail_raw = t.get("detail")
+            detail_str: str | None = str(detail_raw) if detail_raw else None
+            timeline.append((ts, label, "trace", i, detail_str))
 
         children = [sid for sid, pid in self.span_parents.items() if pid == span_id]
         for cid in children:
             cstatus = self.span_status.get(cid, "pending")
             if cid in self.span_start_times:
                 timeline.append(
-                    (self.span_start_times[cid], self._render_label(cid, status="running"))
+                    (self.span_start_times[cid], self._render_label(cid, status="running"),
+                     "child", None, None)
                 )
             if cstatus in self.TERMINAL_STATUSES:
                 end_ts = self.span_end_times.get(cid, 0.0)
@@ -503,31 +541,34 @@ class CairnApp(App[None]):
                 dur = end_ts - start_ts
                 dur_str = f"{dur:.3f}s" if dur > 0.001 else ""
                 extra = f"cached {dur_str}".strip() if cstatus == "cached" else dur_str
-                timeline.append((end_ts, self._render_label(cid, extra, status=cstatus)))
+                timeline.append(
+                    (end_ts, self._render_label(cid, extra, status=cstatus),
+                     "child", None, None)
+                )
 
         timeline.sort(key=lambda x: x[0])
-        if timeline:
-            base_ts = timeline[0][0]
-            for ts, entry in timeline:
-                elapsed = ts - base_ts
-                out.append(f"  {elapsed:7.3f}s ")
-                out.append(entry)
-                out.append("\n")
 
-        # Trace details (markdown blobs) shown after the timeline
-        traces_with_detail = [
-            t for t in self.span_traces.get(span_id, []) if t.get("detail")
-        ]
-        if traces_with_detail:
-            out.append("\n")
-            for t in traces_with_detail:
-                msg = t.get("msg", "")
-                detail = str(t.get("detail", ""))
-                out.append(f"▸ {msg}\n", style="bold dim")
-                for line in detail.splitlines() or [detail]:
-                    out.append(f"    {line}\n", style="dim")
+        base_ts = timeline[0][0] if timeline else 0.0
+        prefix_pad = "            "  # gutter aligned roughly with trace label column
+
+        if timeline or result_str is not None:
+            for ts, label, kind, idx, detail_str in timeline:
+                elapsed = ts - base_ts
+                out.append(f"  {elapsed:7.3f}s  ")
+                out.append(label)
+                out.append("\n")
+                if kind == "trace" and detail_str and idx == selected_trace_idx:
+                    for line in detail_str.splitlines() or [detail_str]:
+                        out.append(f"{prefix_pad}{line}\n", style="dim")
+
+            # Virtual "Result" entry at the bottom — always expanded.
+            if result_str is not None:
+                out.append("  " + " " * 9 + "Result\n", style="bold")
+                for line in result_str.splitlines() or [result_str]:
+                    out.append(f"{prefix_pad}{line}\n")
 
         self._update_detail(out)
+        self._sync_input_visibility(span_id)
 
     # ── Tree interactions ──
 
@@ -549,9 +590,18 @@ class CairnApp(App[None]):
         if data_str.startswith("span:"):
             span_id = int(data_str[5:])
             self.highlighted_span = span_id
+            self.selected_trace = None
+            self._refresh_detail(span_id)
+        elif data_str.startswith("trace:"):
+            _, sid, tidx = data_str.split(":", 2)
+            span_id = int(sid)
+            trace_idx = int(tidx)
+            self.highlighted_span = span_id
+            self.selected_trace = (span_id, trace_idx)
             self._refresh_detail(span_id)
         elif data_str.startswith("run:"):
             self.highlighted_span = None
+            self._sync_input_visibility(None)
             run_info = self._runs_by_id.get(data_str[4:])
             if run_info:
                 self._update_detail(
@@ -562,6 +612,7 @@ class CairnApp(App[None]):
                 )
         elif data_str.startswith("entry:"):
             self.highlighted_span = None
+            self._sync_input_visibility(None)
             self._update_detail("")
 
     # ── Navigation ──
@@ -638,7 +689,11 @@ class CairnApp(App[None]):
 
     @on(InputRequestMessage)
     def on_input_request(self, msg: InputRequestMessage) -> None:
-        """Mount an Input widget in the detail pane for the pending request."""
+        """Mount an Input widget (hidden by default) tied to the awaiting span.
+
+        Visibility is driven by selection: the widget becomes visible only
+        when the user navigates onto the span that's awaiting input.
+        """
         self._pending_inputs[msg.req.id] = msg.fut
         scroll = self.query_one("#detail-scroll", VerticalScroll)
         placeholder = msg.req.metadata.get("placeholder") if msg.req.metadata else None
@@ -648,8 +703,16 @@ class CairnApp(App[None]):
             placeholder=str(placeholder) if placeholder else msg.req.prompt,
             id=f"input-{msg.req.id}",
         )
+        if msg.span_id is not None:
+            self._pending_input_widgets[msg.span_id] = widget
+            if msg.span_id in self.span_status:
+                self.span_status[msg.span_id] = "awaiting"
+                self._set_label(msg.span_id)
         scroll.mount(widget)
-        widget.focus()
+        visible = msg.span_id is None or self.highlighted_span == msg.span_id
+        widget.display = visible
+        if visible:
+            widget.focus()
 
     @on(Input.Submitted)
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -660,7 +723,21 @@ class CairnApp(App[None]):
         fut = self._pending_inputs.pop(req_id, None)
         if fut is not None and not fut.done():
             fut.set_result(event.value)
+        for sid, w in list(self._pending_input_widgets.items()):
+            if w is event.input:
+                del self._pending_input_widgets[sid]
+                break
         event.input.remove()
+
+    def _sync_input_visibility(self, span_id: int | None) -> None:
+        """Show only the pending Input widget belonging to span_id (if any)."""
+        target = (
+            self._pending_input_widgets.get(span_id) if span_id is not None else None
+        )
+        for w in self._pending_input_widgets.values():
+            w.display = w is target
+        if target is not None:
+            target.focus()
 
 
 # ── Entry points ──
