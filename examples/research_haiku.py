@@ -14,22 +14,12 @@ Run:
 
 from __future__ import annotations
 
-import asyncio
 from datetime import date
 
 from cairn import run, step, trace
 from cairn import rate_limited
 
-
-# Why no --bare: it forces auth to ANTHROPIC_API_KEY (OAuth/keychain disabled),
-# which means a Claude subscription (CLAUDE_CODE_OAUTH_TOKEN) doesn't work.
-# Without --bare, CLAUDE.md and auto-memory leak into the default system prompt,
-# so we pass --system-prompt to replace it entirely with a focused research one.
-SYSTEM_PROMPT = (
-    "You are a concise research assistant. Use WebSearch and WebFetch when "
-    "current information is needed. Answer directly, no preamble, no "
-    "meta-commentary. Respect terseness instructions in the user prompt."
-)
+from claude import SEARCH_TOOLS, claude
 
 
 COMPANIES = [
@@ -46,40 +36,10 @@ ANGLES = [
     "research output or benchmark results",
 ]
 
-MODEL = "haiku"
-SEARCH_TOOLS = "WebSearch,WebFetch"
-# Belt-and-suspenders: `--tools` is already a whitelist, but deny writes explicitly.
-DENY_TOOLS = "Write,Edit,NotebookEdit,Bash,MultiEdit"
-
 
 def current_week() -> str:
     y, w, _ = date.today().isocalendar()
     return f"{y}-W{w:02d}"
-
-
-async def _claude(prompt: str, tools: str = "") -> str:
-    """Invoke `claude -p` with a minimal system prompt; return stdout."""
-    args = [
-        "claude",
-        "-p",
-        "--model", MODEL,
-        "--system-prompt", SYSTEM_PROMPT,
-        "--permission-mode", "bypassPermissions",
-        "--tools", tools,
-        "--disallowed-tools", DENY_TOOLS,
-        "--",
-        prompt,
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        msg = (stderr.decode().strip() or stdout.decode().strip() or "(no output)")[:500]
-        raise RuntimeError(f"claude exited {proc.returncode}: {msg}")
-    return stdout.decode().strip()
 
 
 @rate_limited(n=3, memo=True)
@@ -92,7 +52,7 @@ async def angle_search(company: str, angle: str, week: str) -> str:
         f"Return the 2-3 most notable items: headline, date, one-sentence "
         f"summary, source URL. Plain text, bulleted. No preamble."
     )
-    return await _claude(prompt, tools=SEARCH_TOOLS)
+    return await claude(prompt, tools=SEARCH_TOOLS)
 
 
 @step(memo=True)
@@ -105,7 +65,7 @@ async def critique(company: str, findings: dict[str, str]) -> str:
         f"Identify gaps, weak claims, or things that warrant more context. "
         f"Be terse — 3 bullets max.\n\nFindings:\n{joined}"
     )
-    return await _claude(prompt)
+    return await claude(prompt)
 
 
 @step(memo=True)
@@ -119,7 +79,7 @@ async def refine(company: str, findings: dict[str, str], critique_text: str) -> 
         f"and noting gaps explicitly. No preamble.\n\n"
         f"Findings:\n{joined}\n\nCritique:\n{critique_text}"
     )
-    return await _claude(prompt)
+    return await claude(prompt)
 
 
 @step
@@ -147,7 +107,7 @@ async def synthesize(briefs: dict[str, str], week: str) -> str:
         f"{week}, write a 4-sentence synthesis of the AI landscape this week: "
         f"common themes, who stood out, what's next. No preamble.\n\n{joined}"
     )
-    return await _claude(prompt)
+    return await claude(prompt)
 
 
 @step

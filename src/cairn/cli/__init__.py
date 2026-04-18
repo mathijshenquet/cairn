@@ -80,6 +80,10 @@ def cmd_run(script: str, entry_name: str, store: str, *, force: bool = False) ->
     from cairn.run import run as cairn_run
 
     # Load the script as a module
+    script_dir = os.path.dirname(os.path.abspath(script))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
     spec = importlib.util.spec_from_file_location("__cairn_script__", script)
     if spec is None or spec.loader is None:
         print(f"Error: cannot load {script}", file=sys.stderr)
