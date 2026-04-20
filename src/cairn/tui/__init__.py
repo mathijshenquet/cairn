@@ -401,13 +401,10 @@ class CairnApp(App[None]):
             else:
                 sid = e.get("id")
                 subject = int(sid) if sid is not None else None
-            if subject is not None:
-                subj_span = self.graph.spans.get(subject)
-                if (
-                    subject == self.highlighted_span
-                    or (subj_span is not None and subj_span.parent == self.highlighted_span)
-                ):
-                    self._refresh_detail(self.highlighted_span)
+            if subject is not None and self._is_self_or_ancestor(
+                self.highlighted_span, subject
+            ):
+                self._refresh_detail(self.highlighted_span)
 
     def _render_label(
         self, span_id: int, suffix: str = "", status: str | None = None
@@ -446,6 +443,16 @@ class CairnApp(App[None]):
         while cur is not None and cur.parent is not None:
             self._set_label(cur.parent)
             cur = self.graph.spans.get(cur.parent)
+
+    def _is_self_or_ancestor(self, ancestor: int, descendant: int) -> bool:
+        """True if `ancestor` equals `descendant` or lies on its parent chain."""
+        cur: int | None = descendant
+        while cur is not None:
+            if cur == ancestor:
+                return True
+            s = self.graph.spans.get(cur)
+            cur = s.parent if s is not None else None
+        return False
 
     def _format_duration(self, seconds: float) -> str:
         if seconds < 1:
