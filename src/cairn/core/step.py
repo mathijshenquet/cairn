@@ -323,20 +323,10 @@ def _make_step(
 
                 # Structured concurrency cleanup counts as await time on this
                 # span — the body has finished its work; this is just waiting.
-                if span.child_tasks and any(not t.done() for t in span.child_tasks):
-                    emit_event(
-                        "wait",
-                        id=span.id,
-                        kwargs={"on": {"kind": "group", "ids": list(span.child_span_ids)}},
-                    )
+                if span.child_tasks:
                     cleanup_start = time.monotonic()
-                    try:
-                        await asyncio.gather(*span.child_tasks, return_exceptions=True)
-                    finally:
-                        span.suspended_total += time.monotonic() - cleanup_start
-                        emit_event("resume", id=span.id)
-                elif span.child_tasks:
                     await asyncio.gather(*span.child_tasks, return_exceptions=True)
+                    span.suspended_total += time.monotonic() - cleanup_start
 
                 span.end_ts = time.monotonic()
                 wall = span.end_ts - span.start_ts
@@ -358,6 +348,20 @@ def _make_step(
                 return result
 
             except BaseException as exc:
+                # Non-cancel errors: let siblings finish before the exception
+                # propagates. Without this, `asyncio.run()`'s teardown cancels
+                # every still-running task in the loop — meaning an error in
+                # one fan-out branch kills the others mid-flight, wasting
+                # their work. Cancellation itself is left to propagate fast.
+                if (
+                    not isinstance(exc, asyncio.CancelledError)
+                    and span.child_tasks
+                    and any(not t.done() for t in span.child_tasks)
+                ):
+                    cleanup_start = time.monotonic()
+                    await asyncio.gather(*span.child_tasks, return_exceptions=True)
+                    span.suspended_total += time.monotonic() - cleanup_start
+
                 span.end_ts = time.monotonic()
                 if isinstance(exc, asyncio.CancelledError):
                     emit_event("cancel", id=span.id)
@@ -406,7 +410,6 @@ def _make_step(
         # Register with parent for structured concurrency
         if parent is not None:
             parent.child_tasks.append(task)
-            parent.child_span_ids.append(span.id)
 
         return Handle(span, task, args_summary, memo)
 

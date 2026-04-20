@@ -293,7 +293,6 @@ class TaskSpan:
     cached_tracing_value: list[TraceRecord] | None = field(default=None)
     last_trace_ts: float = field(default=0.0)
     child_tasks: list[asyncio.Task[Any]] = field(default_factory=lambda: [])
-    child_span_ids: list[int] = field(default_factory=lambda: [])  # parallel to child_tasks
     start_ts: float = field(default=0.0)
     end_ts: float = field(default=0.0)
     cached: bool = field(default=False)

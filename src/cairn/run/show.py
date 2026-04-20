@@ -87,9 +87,7 @@ def _format_trace(e: dict[str, Any]) -> tuple[str, str]:
 
     line = " ".join(parts)
 
-    if state == "awaiting":
-        color = _CYAN
-    elif level == "error":
+    if level == "error":
         color = _RED
     elif level == "warn":
         color = _YELLOW
@@ -118,10 +116,9 @@ class LiveRenderer:
 
     def render_event(self, e: dict[str, Any]) -> None:
         """Render a single event dict (from JSONL or converted from Event)."""
-        t = self.graph.apply(e)
-        kind = t.kind
-        ts: float = e.get("ts", 0.0)
-        relative_ts: float = ts - (self.graph.first_ts or 0.0)
+        self.graph.apply(e)
+        kind: str = e.get("e", "")
+        relative_ts: float = e.get("ts", 0.0) - (self.graph.first_ts or 0.0)
 
         def name_of(sid: int) -> str:
             s = self.graph.spans.get(sid)
@@ -131,25 +128,19 @@ class LiveRenderer:
             return "  " * self.graph.depth(sid)
 
         if kind == "spawn":
-            span_id = t.span_id
-            if span_id is None:
-                return
+            span_id = int(e["id"])
             s = self.graph.spans.get(span_id)
             args_display = f"({s.args})" if s is not None and s.args else ""
             icon = _color("○", _DIM)
             self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {_BOLD}{name_of(span_id)}{_RESET}{_DIM}{args_display}{_RESET}")
 
         elif kind == "start":
-            span_id = t.span_id
-            if span_id is None:
-                return
+            span_id = int(e["id"])
             icon = _color("◉", _YELLOW)
             self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {name_of(span_id)}")
 
         elif kind == "end":
-            span_id = t.span_id
-            if span_id is None:
-                return
+            span_id = int(e["id"])
             s = self.graph.spans.get(span_id)
             cached = s is not None and s.status == "cached"
             duration = ""
@@ -163,24 +154,20 @@ class LiveRenderer:
                 self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {name_of(span_id)} done{duration}")
 
         elif kind == "error":
-            span_id = t.span_id
-            if span_id is None:
-                return
+            span_id = int(e["id"])
             s = self.graph.spans.get(span_id)
             err = (s.error if s is not None else None) or "unknown error"
             icon = _color("✗", _RED)
             self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {name_of(span_id)} {_color(str(err), _RED)}")
 
         elif kind == "cancel":
-            span_id = t.span_id
-            if span_id is None:
-                return
+            span_id = int(e["id"])
             icon = _color("⊘", _DIM)
             self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {name_of(span_id)} {_color('cancelled', _DIM)}")
 
         elif kind == "trace":
-            parent_id = t.parent_id
-            d = (self.graph.depth(parent_id) + 1) if parent_id is not None else 1
+            parent_id = e.get("parent")
+            d = (self.graph.depth(int(parent_id)) + 1) if parent_id is not None else 1
             indent = "  " * d
             line, style_color = _format_trace(e)
             self._print(f"  {relative_ts:8.3f}s {indent}{style_color}{line}{_RESET}")

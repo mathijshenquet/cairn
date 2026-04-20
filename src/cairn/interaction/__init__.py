@@ -25,7 +25,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeVar, cast
 
-from cairn.core import cached_output, emit_event, next_id, step, trace
+from cairn.core import cached_output, emit_event, next_id, step
 from cairn.core.context import current_span
 
 T = TypeVar("T")
@@ -123,7 +123,6 @@ async def _ask(prompt: str, schema_name: str, metadata: dict[str, Any]) -> Any:
         message=prompt,
         kwargs={"schema": schema_name, "by": anchor, **metadata},
     )
-    trace("awaiting input", detail=prompt, state="awaiting")
     if self_span is not None:
         emit_event(
             "wait",
@@ -135,7 +134,6 @@ async def _ask(prompt: str, schema_name: str, metadata: dict[str, Any]) -> Any:
     finally:
         if self_span is not None:
             emit_event("resume", id=self_span.id)
-    trace("input received", state="done")
     emit_event("input_response", id=req.id)
     return response
 

@@ -22,7 +22,7 @@ from cairn.interaction import await_input
 @step
 async def greet() -> str:
     name = await await_input("What's your name?")
-    trace("Hello, {name}!")
+    trace(f"Hello, {name}!")
     return name
 
 

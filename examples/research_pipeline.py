@@ -21,10 +21,10 @@ _fail_rate: float = 0.0
 _api_sem: asyncio.Semaphore | None = None
 
 @rate_limited(n=5, memo=True)  # no memo — can fail, retried by llm wrapper
-async def claude_api(prompt: str) -> str:
-    """Simulates a Claude API call. Fails ~20% of the time, rate limited."""
+async def fake_api_call(prompt: str) -> str:
+    """Simulates a API call. Fails ~20% of the time, rate limited."""
     # Rate limit
-    trace("calling Claude API", prompt_len=len(prompt), status="running")
+    trace("calling LLM API", prompt_len=len(prompt), status="running")
     await asyncio.sleep(random.uniform(*_delay))
 
     # Random failures
@@ -68,12 +68,12 @@ def _generate_response(prompt: str, h: str) -> str:
 async def llm(prompt: str) -> str:
     """LLM call with automatic retry on API failures."""
     last_error: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             if attempt > 0:
                 trace("retrying API call", attempt=attempt + 1)
                 await asyncio.sleep(0.5 * attempt)  # backoff
-            return await claude_api(prompt)
+            return await fake_api_call(prompt)
         except ConnectionError as e:
             last_error = e
             trace("API failed, will retry", error=str(e), attempt=attempt + 1)
