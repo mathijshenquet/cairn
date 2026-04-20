@@ -44,11 +44,6 @@ def _render_trace_text(e: dict[str, Any]) -> Text:
     cost: dict[str, Any] | None = e.get("cost")
 
     parts: list[str] = []
-    if progress:
-        cur, total = progress[0], progress[1]
-        filled = int(10 * cur / total) if total else 0
-        bar = "█" * filled + "░" * (10 - filled)
-        parts.append(f"[{bar}]")
     if msg:
         parts.append(msg)
     if progress:
