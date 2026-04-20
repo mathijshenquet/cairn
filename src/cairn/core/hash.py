@@ -89,7 +89,7 @@ def resolve_hashable(value: Any, _seen: dict[int, bool] | None = None) -> Any:
 
     raise TypeError(
         f"Unhashable type for cache key: {type(value).__name__}. "
-        f"Register a hash function via register_hash_func(...) or configure(hash_funcs={{...}})"
+        f"Register a hash function via register_hash_func(...)"
     )
 
 

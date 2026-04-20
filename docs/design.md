@@ -1,480 +1,359 @@
 # Cairn: Design
 
-## Overview
+This document describes Cairn as it is, not as it was once sketched. For the
+motivation, read [`motivation.md`](motivation.md); for a comparison with other
+frameworks, read [`patterns.md`](patterns.md).
 
-Cairn has five core primitives:
+## Core primitives
 
 | Primitive | Role |
 |-----------|------|
-| `step` decorator | Turns an async function into a tracked, cached node in the computation graph |
-| `Handle[T]` | Awaitable reference to a running step's result. Enables concurrency and dependency tracking |
-| `trace()` | Formless annotation — emits an atomic event into the trace log |
-| `cached_output()` | Access previous cached result from within a step body |
-| `cached_tracing()` | Access previous trace events with timestamps — enables replay |
+| `@step` | Decorator that turns an async function into a tracked node |
+| `Handle[T]` | Awaitable reference to a running step's result |
+| `trace(...)` | Emit an annotation onto the current span's timeline |
+| `cached_output()` | The step's previous cached result, if any |
+| `cached_tracing()` | The step's previous trace events, with timing |
+| `replayable(fn)` | Wrap a step so cache hits replay with original timing |
+| `rate_limited(n)` | Wrap a step with a concurrency-limiting semaphore |
+| `await_input(prompt)` | Ask a human (or stand-in sink) a question |
 
-One entry point: `run()` (programmatic) or `cairn script.py` (CLI, streamlit-style).
+Everything else — retries, validation loops, fan-out/fan-in — is ordinary
+Python built on top of these.
 
-Everything else — memoization, replay, rate limiting, retry, human-in-the-loop — is built from these primitives in user space or thin library wrappers.
+Entry points: `cairn.run(fn, store_path=".cairn")` programmatically, or
+`cairn script.py` from the shell.
 
 ---
 
-## 1. The `@step` decorator
-
-### Signature
+## 1. `@step`
 
 ```python
 def step(
-    fn: Callable[P, Awaitable[R]] = None,
+    fn: Callable[P, Awaitable[R]] | None = None,
     *,
     memo: bool = False,
-    identity: str | Identity | Callable[[Any], str | Identity] | None = None,
-    version: str | Version | Callable[[Any], str | Version] | None = None,
-) -> Callable[P, Handle[R]]:
-    ...
+    identity: str | Callable[[Any], str] | None = None,
+    version: str | Callable[[Any], str] | None = None,
+) -> Callable[P, Handle[R]]: ...
 ```
 
-### Why `memo=False` by default
+Called without args (`@step`) or with args (`@step(memo=True)`). Wraps an
+`async def` and returns a function that, on call, synchronously returns a
+`Handle[R]` — scheduling the body as a task and emitting a `spawn` event.
 
-`memo=True` means "on cache hit, skip execution entirely and return the stored result." That's the right choice for expensive leaves (LLM calls, heavy computation) but the wrong default for orchestration steps — a memoized step that hits cache doesn't re-execute, which means its child steps never re-spawn, and the computation graph for a rerun looks empty.
+### `memo=False` by default
 
-The asymmetry: an un-memoed step can reconstruct memoed behavior by calling `cached_output()` early and returning. The inverse isn't possible — a memoed step can never choose to re-run its children for observability. So the less-opinionated default (`memo=False`) is strictly more expressive.
+`memo=True` short-circuits on cache hit: the body never runs, children never
+re-spawn. That is right for expensive leaves (LLM calls, heavy fetches) but
+wrong for orchestration — a cache hit on a parent erases the graph underneath.
 
-### Overloads for usage as decorator
-
-```python
-# bare decorator — always runs, identity/version auto-derived
-@step
-async def foo(x: int) -> int: ...
-
-# decorator with options — opt into memoization for expensive leaves
-@step(memo=True)
-async def bar(x: int) -> int: ...
-
-# functional form (used by higher-order wrappers)
-wrapped = step(fn, memo=True, identity=Identity.from_function(original))
-```
-
-### What the decorator does
-
-When a decorated function is called:
-
-1. **Capture parent** — read `_current_span` from `contextvars` to establish the parent-child relationship.
-2. **Create span** — allocate a `TaskSpan` with a unique ID, parent reference, identity, version, and raw arguments.
-3. **Schedule execution** — create an `asyncio.Task` running the step body within a task group.
-4. **Emit spawn event** — write to the trace log.
-5. **Return `Handle[T]`** — immediately, without blocking.
-
-The scheduled execution then:
-
-1. **Set context** — push this span onto `_current_span` so child steps and `trace()` calls know their parent.
-2. **Resolve Handle arguments** — any argument that is a `Handle[T]` is awaited, yielding `T`. This wires up the dependency graph. Join events are emitted for each resolved Handle.
-3. **Compute cache key** — `hash(identity, version, resolved_args)`.
-4. **Check cache** — look up the key in the output store.
-5. **If cached and `memo=True`** — emit an `end` event with `cached: true`, return the stored result. The function body is never called.
-6. **If cached and `memo=False`** — store the cached result/traces in the span context (accessible via `cached_output()` and `cached_tracing()`). Then call the function body.
-7. **If not cached** — call the function body.
-8. **Store result** — write (result, collected traces, duration) to the output store.
-9. **Emit end event** — write to the trace log.
-10. **Wait for task group** — the span doesn't close until all child steps (spawned within this step) have completed. This enforces structured concurrency.
+`memo=False` (the default) still populates `cached_output()` / `cached_tracing()`
+when a cache entry exists, so the body can short-circuit itself or replay
+with simulated timing. The less-opinionated default is strictly more
+expressive.
 
 ### Identity and version
 
-**Identity** answers: "what function is this?" It's the stable name across code changes.
+`StepInfo` identifies a step with two strings:
 
-- Default: `f"{module}:{qualname}"` (e.g., `pipeline:research_loop`)
-- Override: any string or `Identity` object
+- **`name`** — "which function is this" across edits. Default:
+  `f"{module}:{qualname}"`. Stable across whitespace / rename-less changes.
+- **`version`** — "which implementation". Default: a sha256 over the function
+  body and its resolved free variables / attribute chains (see `core/types.py`
+  for the walker). Changing the body, or a module-level constant it reads,
+  invalidates the hash. Changing an unrelated function does not.
 
-**Version** answers: "which implementation of this function?" It changes when the code changes.
-
-- Default: hash of `inspect.getsource(fn)` (v1). Recursive dependency hashing in v2.
-- Override: any string or `Version` object
-
-Identity and version are both overridable via the decorator or via higher-order wrappers. This is essential for patterns like `replayable(fn)` which needs to share the original function's identity and version.
-
-Display:
-- `identity.short()` — human-readable, e.g., first 8 hex digits
-- `identity.long()` — full hash or qualified name
-- Same for `version.short()` / `version.long()`
-
-### Arguments and the cache key
-
-The cache key is `sha256(canonical(identity, version, resolved_args))`. Arguments must be reducible to a canonical hashable form.
-
-Built-in support:
-- Primitives: `str`, `int`, `float`, `bool`, `None`
-- Collections: `list`, `tuple`, `dict` (sorted keys), `frozenset`
-- Nested combinations of the above
-
-For everything else, a `hash_funcs` registry (Streamlit-style):
+Both are overridable via the decorator kwargs:
 
 ```python
-configure(hash_funcs={
-    Path: lambda p: (str(p), p.stat().st_mtime) if p.exists() else str(p),
-    DatabaseConnection: lambda db: db.url,
-})
+@step(version="v3")
+async def fetch(url: str) -> str: ...
+
+# or a callable: receives the raw fn, returns a string
+@step(version=lambda fn: sha_of_prompt_file(fn))
+async def research(...): ...
 ```
 
-Resolution uses MRO — registering for `BaseModel` covers all Pydantic subclasses. The hash function returns something the framework re-resolves recursively, so `Path` returning `(str, float)` just works.
-
-### Return type and serialization
-
-Results must be serializable for caching. Built-in support:
-
-- `str` — UTF-8
-- JSON-serializable types (`dict`, `list`, primitives) — `json.dumps` with sorted keys
-
-For everything else, a `serializers` registry:
+Higher-order wrappers forward identity/version to preserve cache continuity:
 
 ```python
-configure(serializers={
-    MyType: (serialize_fn, deserialize_fn),
-})
+info = StepInfo.from_function(fn)
+return step(wrapper, identity=info.name, version=info.version)
 ```
 
-Plugins extend this: `cairn[pydantic]` registers `BaseModel` serialization, `cairn[pickle]` adds pickle support.
+### Arguments and cache keys
+
+The cache key is
+`sha256(canonical(identity, version, resolved_args))`.
+Arguments are canonicalized into a JSON-serializable tree (primitives,
+lists/tuples, dicts with sorted keys, sets) by `resolve_hashable()`. Unknown
+types raise `TypeError` — silent fallback masks real bugs (e.g. caching on
+`repr(numpy_array)` which is often lossy).
+
+Extend support with `register_hash_func`:
+
+```python
+from cairn import register_hash_func
+register_hash_func(Path, lambda p: (str(p), p.stat().st_mtime_ns))
+```
+
+MRO resolution means registering for a base class covers subclasses.
+
+Built-in hashers (`core/hash.py`):
+
+- `Path` — `(str, mtime_ns, size)` for existing paths, a `missing` sentinel
+  otherwise.
+- `functools.partial` — hashed via `StepInfo.from_function(p.func)`, so
+  editing the underlying function invalidates partial-bound steps too.
+- `pydantic.BaseModel` — activated automatically if pydantic is importable;
+  uses `model_dump(mode="json")`.
+
+### Return types and serialization
+
+Results round-trip through a registry (`core/serial.py`). Built in: `str`,
+`bytes`, anything `json.dumps` handles. Extend via `register_serializer(tp,
+serialize, deserialize)`.
 
 ### Typing
 
-The decorator transforms the return type:
+The decorator transforms `Callable[P, Awaitable[R]] → Callable[P, Handle[R]]`
+with a `ParamSpec`. Pyright understands this.
 
-```python
-P = ParamSpec("P")
-R = TypeVar("R")
+The argument transformation (`T → T | Handle[T]`) is not expressible in the
+Python type system today. At runtime, passing a `Handle[str]` where `str` is
+expected works — the decorator awaits it before calling the body. At
+check-time, pyright will flag it. A plugin or narrower API could fix this
+later; for now it is a known wart.
 
-# step: Callable[P, Awaitable[R]] → Callable[P, Handle[R]]
-```
+### What the decorator does
 
-This works with pyright via `ParamSpec`.
+On call (synchronous):
 
-The argument transformation (`T` → `T | Handle[T]`) is **not** expressible with current Python typing without a plugin. In v1, passing a `Handle[str]` where `str` is expected will produce a type checker warning. This is a known limitation — the runtime handles it correctly.
+1. Read `current_span` from contextvars for the parent.
+2. Allocate a `TaskSpan(id, parent_id, name, info)`.
+3. `asyncio.create_task(run())` for the body.
+4. Register the task on the parent's `child_tasks`.
+5. Emit `spawn`.
+6. Return `Handle[R]`.
+
+Inside `run()` (async):
+
+1. Push the span onto `current_span`.
+2. Record `start_ts`.
+3. Resolve any `Handle` arguments by awaiting them (contributes to
+   `suspended_total`, not `own_time`).
+4. Compute the cache key. Look it up.
+5. If hit (and not an error): populate `cached_output_value` /
+   `cached_tracing_value`. If `memo=True`, emit `end{cached:true}` and
+   return the cached value.
+6. Emit `start`. Run the body.
+7. After the body returns, `asyncio.gather` any remaining `child_tasks` —
+   structured concurrency, so a step never outlives its parent.
+8. Store the result (or the error, on the exception path).
+9. Emit `end` with size/time metrics.
+
+On an exception: gather children first (a fan-out failure shouldn't wipe the
+siblings still in flight), then store the error and emit `error`.
+Cancellation is allowed to propagate fast; the cancel path emits `cancel`.
 
 ---
 
 ## 2. `Handle[T]`
 
-A Handle is an awaitable reference to a running step's eventual result.
-
-### Creation
-
-A Handle is returned immediately when a `step`-decorated function is called. Under the hood it wraps an `asyncio.Task`.
-
 ```python
-h = research("cat", spec)   # returns Handle[str] immediately
-result = await h              # blocks until research completes
+class Handle(Generic[R]):
+    def __await__(self) -> Generator[Any, Any, R]: ...
+    def cancel(self) -> None: ...
+    def done(self) -> bool: ...
+    @property
+    def span(self) -> TaskSpan: ...
 ```
 
-### Lifecycle events
+Returned synchronously by a `@step`-decorated call. Wraps an `asyncio.Task`.
 
-- **Spawn** — emitted when the Handle is created (in `Handle.__init__`). Records: span ID, parent span ID, step name.
-- **Join** — emitted when the Handle is awaited (in `Handle.__await__`). Records: span ID, awaiter's span ID.
+Awaiting a Handle emits a `wait` event on the awaiting span (with an `on`
+field pointing at the target), enters await-accounting for that span, and
+emits `resume` when the result is ready. `trace()` and child `@step` calls
+inside the body see the right parent because each task has its own
+contextvars copy.
 
-This enables the UI to detect fan-out (multiple spawns without intervening joins) and fan-in (multiple joins).
-
-### Passing Handles as arguments
-
-A Handle can be passed directly to another `step`-decorated function:
-
-```python
-page = fetch(url)                # Handle[str]
-links = extract_links(page)      # page is Handle[str], framework awaits it
-summary = summarize(extract_content(page))  # chained
-```
-
-The receiving function's decorator resolves Handles before calling the body. The function body always sees `T`, never `Handle[T]`. Join events are emitted for each resolution, building the dependency graph in the trace.
-
-### Task group and structured concurrency
-
-Each `step` execution runs within an implicit task group (anyio `TaskGroup`). All child steps spawned within a parent belong to the parent's task group. The parent's span does not close until all children complete.
-
-```python
-@step
-async def parent():
-    h1 = child_a()    # spawned in parent's task group
-    h2 = child_b()    # spawned in parent's task group
-    return await h1    # h2 still running
-    # parent's body returns, but span stays open until h2 completes
-```
-
-When someone awaits the parent's Handle, they get the return value once the body finishes. But the parent span in the trace doesn't close until all children are done. This prevents leaked tasks — no orphaned `asyncio.Task`s that run forever.
-
-### API
-
-```python
-class Handle(Generic[T]):
-    def __await__(self) -> Generator[Any, Any, T]:
-        """Await the result. Emits a join event."""
-        ...
-
-    def cancel(self) -> None:
-        """Cancel the underlying task."""
-        ...
-
-    def done(self) -> bool:
-        """Check if the task has completed."""
-        ...
-```
-
-Mirrors `anyio.abc.TaskStatus` / `asyncio.Task` where applicable.
+`Handle` instances can be passed directly as arguments to another `@step` —
+the receiving decorator awaits them before the body sees them.
 
 ---
 
 ## 3. `trace()`
 
-### Signature
-
 ```python
-def trace(message: str, **kwargs: Any) -> None
+def trace(
+    message: str,
+    *,
+    detail: str = "",
+    progress: tuple[int, int] | None = None,
+    state: str | None = None,
+    level: Literal["info", "warn", "error"] = "info",
+    cost: dict[str, int | float] | None = None,
+    edge: bool = False,
+) -> None: ...
 ```
 
-Formless. The core records `(timestamp, parent_span_id, message, kwargs)` and does not interpret any kwargs. This is an atomic event — no duration, no start/end.
+Emits a `trace` event and appends a `TraceRecord` to the current span. Fields:
 
-### What it does
+- `message` — short label shown on the timeline.
+- `detail` — free-form text shown when the trace is expanded.
+- `progress` — `(current, total)`, renders as a bar.
+- `state` — sub-lifecycle tag. `rate_limited` uses `"pending"` → `"running"`.
+- `level` — `"info"` (default), `"warn"`, `"error"`; controls colouring.
+- `cost` — numeric columns (`tokens_in`, `tokens_out`, `cost_usd`, …) that
+  the UI sums up the span tree.
+- `edge=True` — marks a transition annotation between two sibling steps
+  (e.g. "retrying" between `validate` and `refine`).
 
-1. Read `_current_span` from contextvars to get the parent.
-2. Emit a trace event to the log.
-3. Append the trace record to the parent span's collected traces (for `cached_tracing()`).
-
-### Usage patterns
-
-```python
-# Progress
-trace("processing", progress=(3, 10))
-
-# Status annotation
-trace("waiting for rate limit slot", status="pending")
-trace("calling API", status="running")
-
-# Edge annotation (labels transition between child steps)
-trace("retrying", edge=True, reason="validation failed")
-
-# Arbitrary metadata
-trace("checkpoint", model="gpt-4", tokens=1523)
-```
-
-The core ships no opinions about what kwargs mean. UI plugins interpret conventions:
-- `progress` key → render a progress bar
-- `status` key → color the node
-- `edge=True` → label the edge between previous and next child step
-
-### Typed extensions via plugins
-
-The core `trace()` has `**kwargs: Any`. A UI plugin re-exports it with typed kwargs using PEP 692:
-
-```python
-# cairn_ui/trace.py
-class UITraceKwargs(TypedDict, total=False):
-    progress: tuple[int, int]
-    status: str
-    edge: bool
-
-def trace(message: str, **kwargs: Unpack[UITraceKwargs]) -> None:
-    _core_trace(message, **kwargs)
-```
-
-Import from the plugin for autocomplete; import from core for formless. Same function at runtime.
-
-### Edge annotations
-
-A `trace(..., edge=True)` between two child steps annotates the transition:
-
-```python
-result = await validate(spec, draft)    # child A ends
-trace("retrying", edge=True)            # annotates A → B transition
-draft = await refine(draft, feedback)   # child B starts
-```
-
-Only one `edge=True` trace between a pair of children. Multiple is an error. Traces without `edge=True` are plain events on the parent's timeline.
+The set of recognized kwargs is narrow on purpose: the UI can rely on them.
+Plugins that want richer metadata can put it on `detail` as a JSON blob.
 
 ---
 
-## 4. `cached_output()` and `cached_tracing()`
-
-### `cached_output() -> T | None`
-
-Returns the previous cached result for the current step invocation, or `None` if no cache entry exists.
-
-Always available in any step, regardless of the `memo` setting:
-- `memo=True` — the framework auto-returns the cached value before calling the body. The body is never called, so `cached_output()` is moot.
-- `memo=False` — the framework calls the body. `cached_output()` returns the previous result if one exists.
-
-### `cached_tracing() -> list[TraceRecord] | None`
-
-Returns the trace events from the previous cached execution, with relative timestamps (deltas). Enables faithful replay:
+## 4. `cached_output()` / `cached_tracing()`
 
 ```python
-prev = cached_output()
-traces = cached_tracing()
-if prev is not None and traces is not None:
-    for t in traces:
-        await anyio.sleep(t.delta)
-        trace(t.message, **t.kwargs)
-    return prev
+def cached_output() -> Any | None: ...
+def cached_tracing() -> list[TraceRecord] | None: ...
 ```
 
-### What's stored in the cache
+Return the previous cached result, and the list of trace events from that
+execution (with `delta` fields — relative time since the previous trace).
+`None` means no prior entry.
 
-Each cache entry contains:
-- `result` — the serialized return value
-- `traces` — list of `TraceRecord(message, delta, kwargs)` from that execution
-- `error` — the exception, if the step failed (stored for browsing, but not returned as a cache hit)
+Available in any step. With `memo=True` the body isn't called on a hit, so
+these are only useful in `memo=False` steps that want to inspect or replay
+their own history.
+
+Example — `replayable` (shipped in `cairn.core.patterns`):
+
+```python
+def replayable(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        prev = cached_output()
+        traces = cached_tracing()
+        if prev is not None and traces is not None:
+            for t in traces:
+                await asyncio.sleep(t.delta)
+                trace(t.message, **t.kwargs)
+            return prev
+        return await fn(*args, **kwargs)
+    info = StepInfo.from_function(fn)
+    return step(wrapper, memo=False, identity=info.name, version=info.version)
+```
 
 ---
 
 ## 5. Event log
 
-### Format
+Append-only JSONL (`runs/{entry}-{ts}/trace.jsonl`). One line per event.
 
-Append-only JSONL. One line per event. All events have a `ts` (monotonic timestamp) field.
+Event kinds:
 
-### Event types
+| `kind` | Emitted when | Key fields |
+|--------|--------------|------------|
+| `spawn` | Handle created | `id`, `parent_id`, `name`, `kwargs.{identity,version,args,memo}` |
+| `start` | Body begins | `id` |
+| `end` | Body finished (or `memo` cache-hit) | `id`, `cached?`, `kwargs.{cache_key,size,own_size,time,own_time}` |
+| `error` | Body raised | `id`, `error`, `kwargs.{size,own_size,time,own_time}` |
+| `cancel` | Body was cancelled | `id` |
+| `wait` | A Handle was awaited | `id` (awaiter), `kwargs.on = {kind,id}` |
+| `resume` | Awaiter reawakened | `id` |
+| `trace` | `trace()` call | `parent_id`, `message`, `kwargs` |
+| `input_request` | `await_input()` asked | `id`, `message`, `kwargs.{schema,by,...}` |
+| `input_response` | Sink answered | `id` |
 
-```
-spawn   — Handle created. Fields: id, parent, name, identity, version
-start   — Step body begins executing. Fields: id
-end     — Step body completed. Fields: id, cached (bool, optional)
-error   — Step body raised an exception. Fields: id, err
-join    — Handle awaited. Fields: id, by
-trace   — Annotation. Fields: parent, msg, **kwargs
-```
-
-### Context tracking
-
-A `ContextVar[TaskSpan | None]` called `_current_span` tracks the active step. Set on step entry, reset on step exit. Child steps and `trace()` calls read it to determine their parent.
-
-Since each `asyncio.Task` gets its own contextvars copy, concurrent steps have independent parent tracking. No locks needed.
-
-### Example event log
-
-For this code:
-
-```python
-@step
-async def main():
-    handles = [research(a) for a in ["cat", "dog"]]
-    for h in handles:
-        await h
-
-@step
-async def research(subject: str) -> str:
-    trace("building prompt")
-    return await claude(f"research {subject}")
-```
-
-The log:
-
-```jsonl
-{"e":"spawn","id":"1","name":"main","ts":0}
-{"e":"start","id":"1","ts":1}
-{"e":"spawn","id":"2","parent":"1","name":"research","ts":2}
-{"e":"spawn","id":"3","parent":"1","name":"research","ts":3}
-{"e":"start","id":"2","ts":4}
-{"e":"start","id":"3","ts":5}
-{"e":"trace","parent":"2","msg":"building prompt","ts":6}
-{"e":"spawn","id":"4","parent":"2","name":"claude","ts":7}
-{"e":"trace","parent":"3","msg":"building prompt","ts":8}
-{"e":"spawn","id":"5","parent":"3","name":"claude","ts":9}
-{"e":"start","id":"4","ts":10}
-{"e":"start","id":"5","ts":11}
-{"e":"end","id":"4","ts":2000}
-{"e":"end","id":"2","ts":2001}
-{"e":"join","id":"2","by":"1","ts":2002}
-{"e":"end","id":"5","ts":3000}
-{"e":"end","id":"3","ts":3001}
-{"e":"join","id":"3","by":"1","ts":3002}
-{"e":"end","id":"1","ts":3003}
-```
-
-The UI reconstructs the tree from `parent` pointers and renders:
-
-```
-main                        [0 ————————————————————— 3003]
-├── research("cat")         [2 ——————————— 2001]
-│   ├── "building prompt"       [6]
-│   └── claude(...)         [7 ———————— 2000]
-├── research("dog")         [3 ———————————————— 3001]
-│   ├── "building prompt"       [8]
-│   └── claude(...)         [9 —————————————— 3000]
-```
-
-Fan-out detected: two spawns from "1" before any joins.
+Context tracking uses `ContextVar[TaskSpan | None]` (`current_span`). Each
+`asyncio.Task` inherits its own copy, so concurrent siblings have independent
+parents without any locking.
 
 ---
 
 ## 6. Stores
 
-### Output store
+### Output store — `FileStore`
 
-Content-addressed. Maps cache keys to serialized results.
-
-```
-.cairn/outputs/{cache_key_hash}
-```
-
-Each entry is an immutable blob containing the serialized result (or error), collected trace records, and execution metadata. The cache key is `sha256(canonical(identity, version, resolved_args))`.
-
-Entries with errors are stored (for browsability) but treated as cache misses on re-execution — errors are retried, not replayed.
-
-### Trace store (runs)
-
-Per-run execution logs with symlinks into the output store.
+Content-addressed. One JSON file per entry:
 
 ```
-.cairn/runs/
-    main-2026-04-16T10:30:00/
+{store_path}/outputs/{cache_key}.json
+```
+
+Each blob carries `result`, serialized `traces`, `duration`, `own_duration`,
+and (optionally) a stringified `error`. Writes are atomic (write tmp, fsync,
+rename). Entries with errors are stored for browsability but treated as
+cache misses — errors are retried, not replayed.
+
+`StoreStats(size, own_size)` is returned on `put`; `own_size` leaves room
+for a future L0/CAS layer without breaking the Protocol.
+
+### Run store — layout
+
+```
+{store_path}/runs/
+    {entry_label}-{iso-utc}/
         trace.jsonl
-        001-research-cat → ../../outputs/a3f...
-        002-claude-abc123 → ../../outputs/b7e...
-        003-research-dog → ../../outputs/c91...
-        004-claude-def456 → ../../outputs/d04...
-    main/
-        latest → ../main-2026-04-16T10:30:00
+        001-step_name  →  ../../outputs/{key}.json
+        002-step_name  →  ../../outputs/{key}.json
+    {entry_label}     →  {entry_label}-{iso-utc}     (GC root: "latest")
 ```
 
-Key format: `{entry_point_id}-{datetime}`. Within a run: `{seqid}-{step_name}` symlinks, flat, sorted by execution order.
-
-The `{entry_point_id}/latest` symlink always points to the most recent run for that entry point.
+The `{entry_label}` symlink at the `runs/` level is also the GC root for
+`--keep-latest`. Per-step symlinks are created as `end` events arrive.
 
 ### Garbage collection
 
-Nix-style: remove old run directories from `runs/`. Then sweep `outputs/` for blobs with no remaining symlinks pointing to them. A `cairn gc` command or programmatic API.
+`cairn.run.gc(store, before=..., keep_latest=True)` removes old run
+directories, then sweeps `outputs/` for blobs with no surviving symlinks —
+Nix-style. CLI: `cairn gc [--before YYYY-MM-DD]`.
 
 ---
 
 ## 7. `run()` and CLI
 
-### Programmatic entry point
+Programmatic:
 
 ```python
 from cairn import run
 
-run(
-    main,                          # entry step function
-    store=FileStore(".cairn"),      # cache backend (default: file-based)
-    sink=JSONLSink(".cairn/runs"),  # trace log destination
-)
+result = run(pipeline, store_path=".cairn", args=(arg1,), kwargs={"k": v})
 ```
 
-`run()` sets up the event loop, initializes the output store and trace sink in contextvars, executes the entry step, waits for all tasks to complete, and exits.
+`run()` spins up an event loop, creates a `RunManager` (output store + trace
+sink + run directory), sets contextvars, awaits the entry Handle, then
+closes the sink and updates the `latest` symlink.
 
-### CLI entry point
+CLI:
 
-```bash
-cairn script.py                 # runs main() from script.py
-cairn script.py:my_pipeline     # runs my_pipeline() from script.py
-cairn script.py --replay        # swaps in replayable wrappers
+```sh
+cairn script.py                          # run main() from script.py
+cairn script.py my_entry                 # run my_entry() (space, not colon)
+cairn script.py --force                  # clear cache for this entry, then run
+cairn                                    # interactive run browser (TUI)
+cairn list                               # list runs
+cairn show [RUN_ID]                      # show trace (latest if omitted)
+cairn output PATH                        # show a cached output blob
+cairn gc [--before YYYY-MM-DD]           # remove old runs
 ```
 
-Streamlit-style: launches a frontend (if a UI plugin is installed), runs the script, handles human interaction through the UI. Same runtime as `run()`, just with defaults wired up.
+`cairn script.py` opens the TUI (detail pane, live updating span tree) if
+`cairn[tui]` is installed; otherwise runs headless.
 
 ---
 
 ## 8. Higher-order patterns
 
-These are **not** framework builtins. They are user-space functions built from the core primitives. The framework provides the building blocks; users compose them.
+These are not framework features. They are ordinary functions built on
+the primitives.
 
-### Memoization (opt-in)
+### Memoization
 
-When `memo=True`, the decorator auto-short-circuits on cache hit. This is equivalent to:
+`memo=True` is equivalent to "short-circuit when `cached_output()` hits":
 
 ```python
 prev = cached_output()
@@ -483,57 +362,15 @@ if prev is not None:
 return await fn(*args, **kwargs)
 ```
 
-### Replayable
-
-Replays from cache with simulated timing. Indistinguishable from a live execution — no `cached: true` in the trace.
-
-```python
-def replayable(fn: Callable[P, Awaitable[R]]) -> Callable[P, Handle[R]]:
-    @functools.wraps(fn)
-    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        prev = cached_output()
-        traces = cached_tracing()
-        if prev is not None and traces is not None:
-            for t in traces:
-                await anyio.sleep(t.delta)
-                trace(t.message, **t.kwargs)
-            return prev
-        return await fn(*args, **kwargs)
-    return step(
-        wrapper, memo=False,
-        identity=Identity.from_function(fn),
-        version=Version.from_function(fn),
-    )
-```
-
-### Rate limiting
-
-```python
-def rate_limited(n: int):
-    sem = anyio.Semaphore(n)
-
-    def decorator(fn: Callable[P, Awaitable[R]]) -> Callable[P, Handle[R]]:
-        @functools.wraps(fn)
-        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-            trace("waiting for slot", status="pending")
-            async with sem:
-                trace("acquired slot", status="running")
-                return await fn(*args, **kwargs)
-        return step(
-            wrapper, memo=True,
-            identity=Identity.from_function(fn),
-            version=Version.from_function(fn),
-        )
-    return decorator
-```
+The asymmetry argued above is why this is opt-in.
 
 ### Retry
 
 ```python
 def with_retry(max_attempts: int = 3):
-    def decorator(fn: Callable[P, Awaitable[R]]) -> Callable[P, Handle[R]]:
+    def decorator(fn):
         @functools.wraps(fn)
-        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        async def wrapper(*args, **kwargs):
             for attempt in range(max_attempts):
                 try:
                     trace(f"attempt {attempt + 1}", progress=(attempt + 1, max_attempts))
@@ -541,239 +378,76 @@ def with_retry(max_attempts: int = 3):
                 except Exception as e:
                     if attempt == max_attempts - 1:
                         raise
-                    trace("retrying", error=str(e))
-        return step(
-            wrapper, memo=True,
-            identity=Identity.from_function(fn),
-            version=Version.from_function(fn),
-        )
+                    trace("retrying", detail=str(e), level="warn")
+        info = StepInfo.from_function(fn)
+        return step(wrapper, memo=True, identity=info.name, version=info.version)
     return decorator
 ```
 
 ### Validation loop
 
-A higher-order pattern: research + validate + refine in a loop.
-
 ```python
-async def validated(
-    generate_fn,
-    validate_fn,
-    refine_fn,
-    *args,
-    max_retries: int = 3,
-    **kwargs,
-):
-    draft = await generate_fn(*args, **kwargs)
+async def validated(generate, validate, refine, *args, max_retries=3, **kwargs):
+    draft = await generate(*args, **kwargs)
     for i in range(max_retries):
-        result = await validate_fn(draft)
+        result = await validate(draft)
         if result["success"]:
             return draft
-        trace("retrying", edge=True, attempt=i + 1, feedback=result["feedback"])
-        draft = await refine_fn(draft, result["feedback"])
+        trace("retrying", edge=True, progress=(i + 1, max_retries))
+        draft = await refine(draft, result["feedback"])
     return draft
 ```
 
-Used as:
+Same shape for any generate / validate / refine triple. See
+`examples/research_fake_llm.py` for a running version.
+
+### Human in the loop
+
+`cairn.interaction.await_input` is the primitive:
 
 ```python
-report = await validated(
-    research, validate, refine,
-    subject="cat", spec=spec,
-)
+from cairn.interaction import await_input, set_interaction_sink, StdinInteractionSink
+
+set_interaction_sink(StdinInteractionSink())
+
+@step
+async def confirm(plan: str) -> str:
+    return await await_input(f"Approve?\n{plan}", placeholder="y/n")
 ```
 
-### Human-in-the-loop
-
-Human interaction is just a step that blocks until input arrives via an external harness:
-
-```python
-@step(memo=False)
-async def human_review(question: str, prefill: str | None = None) -> str:
-    prev = cached_output()
-    return await harness.ask(question, prefill=prev or prefill)
-```
-
-The harness is injected via contextvar or constructor. It implements:
-
-```python
-class InputHarness(Protocol):
-    async def ask(self, question: str, prefill: str | None = None) -> str: ...
-    async def judge(self, item: str) -> Judgment: ...
-```
-
-Different harness implementations: web UI, TUI, Telegram bot, Slack, etc. Separate packages (`cairn-web`, `cairn-tui`).
+It's a memoized `@step` underneath, so re-runs replay the previous answer
+as a prefill. Sinks — stdin, queue for tests, TUI input widget — implement
+a single `async def request(req: InputRequest) -> Any`.
 
 ---
 
-## 9. Plugin architecture
+## 9. Pluggability
 
-### Serialization plugins (extras)
-
-Lightweight. Shipped as optional dependencies of the main package.
-
-```toml
-# pyproject.toml
-[project.optional-dependencies]
-pydantic = ["pydantic>=2.0"]
-pickle = []
-all = ["cairn[pydantic]"]
-```
-
-Activated by explicit import:
-
-```python
-import cairn.ext.pydantic   # registers BaseModel hash_func + serializer
-```
-
-### Harness plugins (separate packages)
-
-Heavier. Have their own dependencies and logic.
-
-```
-cairn-web        # web UI for trace visualization + human interaction
-cairn-tui        # terminal UI
-cairn-telegram   # Telegram bot harness
-```
-
-### UI trace extensions (re-exports)
-
-UI plugins re-export `trace()` with typed kwargs:
-
-```python
-from cairn_web import trace   # typed: progress, status, edge
-# vs
-from cairn import trace       # formless: **Any
-```
-
-Same function at runtime, different types at check time.
+- **Hashers** — `register_hash_func(tp, fn)`.
+- **Serializers** — `register_serializer(tp, ser, de)`.
+- **Stores** — anything implementing the `Store` protocol (`get`, `put`,
+  `has`). `MemoryStore` + `FileStore` ship in core.
+- **Sinks** — anything implementing `Sink.emit(event)`. `JSONLSink`,
+  `MemorySink`, `NullSink`, `CompositeSink` ship in core.
+- **Interaction sinks** — `InteractionSink.request(req)`. Stdin + queue
+  sinks in `cairn.interaction`; the TUI ships its own.
 
 ---
 
-## 10. Configuration
+## 10. Known gaps
 
-Global configuration via `configure()`:
+See `docs/todo/` for parked design work:
 
-```python
-from cairn import configure
+- [`nominal-identity.md`](todo/nominal-identity.md) — nominal vs. intensional
+  identity (the current source-hash default is a known-imperfect proxy).
+- [`anyio.md`](todo/anyio.md) — migrating `asyncio.TaskGroup` to anyio's
+  `TaskGroup.create_task` once it ships, to unlock trio support.
 
-configure(
-    hash_funcs={
-        Path: lambda p: (str(p), p.stat().st_mtime) if p.exists() else str(p),
-    },
-    serializers={
-        MyType: (serialize_fn, deserialize_fn),
-    },
-)
-```
+Not parked but worth naming:
 
-For v1, configuration is global (one process = one config). Internally backed by contextvars so it can become per-runtime in v2 without breaking the API.
-
----
-
-## Appendix: pseudocode for core runtime
-
-```python
-_current_span: ContextVar[TaskSpan | None] = ContextVar('current_span', default=None)
-
-def emit(event: dict):
-    sink.write({**event, "ts": monotonic()})
-
-
-class Handle(Generic[T]):
-    def __init__(self, span: TaskSpan, task: asyncio.Task[T]):
-        self._span = span
-        self._task = task
-        emit({"e": "spawn", "id": span.id, "parent": span.parent_id, "name": span.name})
-
-    def __await__(self):
-        awaiter = _current_span.get()
-        emit({"e": "join", "id": self._span.id, "by": awaiter.id if awaiter else None})
-        return self._task.__await__()
-
-    def cancel(self):
-        self._task.cancel()
-
-    def done(self) -> bool:
-        return self._task.done()
-
-
-def step(fn=None, *, memo=False, identity=None, version=None):
-    if fn is None:
-        return functools.partial(step, memo=memo, identity=identity, version=version)
-
-    _identity = identity or Identity.from_function(fn)
-    _version = version or Version.from_function(fn)
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        parent = _current_span.get()
-        span = TaskSpan(
-            id=next_id(),
-            parent_id=parent.id if parent else None,
-            name=fn.__name__,
-            identity=_identity,
-            version=_version,
-            raw_args=(args, kwargs),
-        )
-
-        async def run():
-            token = _current_span.set(span)
-            try:
-                async with anyio.create_task_group() as tg:
-                    span._task_group = tg
-
-                    # resolve Handle arguments
-                    resolved = {}
-                    for k, v in span.bound_args.items():
-                        resolved[k] = (await v) if isinstance(v, Handle) else v
-
-                    # cache lookup
-                    key = cache_key(_identity, _version, resolved)
-                    cached = store.get(key)
-
-                    if cached is not None:
-                        span._cached_output = cached.result
-                        span._cached_tracing = cached.traces
-                        if memo:
-                            emit({"e": "end", "id": span.id, "cached": True})
-                            return cached.result
-
-                    # execute
-                    emit({"e": "start", "id": span.id})
-                    result = await fn(**resolved)
-                    emit({"e": "end", "id": span.id})
-
-                    # store
-                    store.put(key, CacheEntry(result, span._traces))
-                    return result
-                # task group exits here — waits for all children
-
-            except Exception as exc:
-                emit({"e": "error", "id": span.id, "err": str(exc)})
-                raise
-            finally:
-                _current_span.reset(token)
-
-        return Handle(span, asyncio.create_task(run()))
-
-    wrapper.identity = _identity
-    wrapper.version = _version
-    return wrapper
-
-
-def trace(message: str, **kwargs):
-    parent = _current_span.get()
-    emit({"e": "trace", "parent": parent.id if parent else None, "msg": message, **kwargs})
-    if parent:
-        parent._traces.append(TraceRecord(message, monotonic(), kwargs))
-
-
-def cached_output():
-    span = _current_span.get()
-    return span._cached_output if span else None
-
-
-def cached_tracing():
-    span = _current_span.get()
-    return span._cached_tracing if span else None
-```
+- **Pyright can't express `T | Handle[T]`** on arguments — see §1.
+- **Trace sink is file-only** — no streaming to a live web UI out of the
+  box. `CompositeSink` makes this straightforward to add; no one has yet.
+- **No token-level streaming** — the event model is event-per-action. LLM
+  token streaming should be handled inside a step body (e.g. by emitting
+  periodic `trace("...", progress=...)`), not by the framework.

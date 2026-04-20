@@ -1,28 +1,47 @@
+<p align="center">
+  <img src="docs/logo.jpg" alt="Cairn" width="600">
+</p>
+
 # Cairn
 
-A microframework for compute graphs with caching, tracing, and replay.
+**A microframework for compute graphs with caching, tracing, and replay.**
 
-Think **PyTorch for agent pipelines** — though nothing about it is agent-specific. You write async Python; a `@step` decorator turns each function into a tracked, cached node in a graph that emerges from execution rather than being declared up front.
+Think *PyTorch for agent pipelines* — though nothing about it is agent-specific.
+You write ordinary async Python; a `@step` decorator turns each function into a
+tracked, and optionally cached node in a graph that emerges from execution instead of being
+declared up front.
 
-> ⚠️ **Alpha.** The API is unstable and will change without notice. No semver guarantees. Not on PyPI. Pin to a commit if you depend on it.
+> **Alpha.** Public API names, the on-disk cache format, and the higher-order
+> wrappers may still change between minor versions. Pin to a commit if you
+> depend on it. Not on PyPI yet.
 
 ## Why
 
-Declarative graph frameworks (LangGraph, CrewAI, Airflow-style DAGs) force you into their node/edge DSL. Cairn does the opposite: the graph is your code, the framework just instruments it. From that you get caching keyed on function identity + version + inputs, a live trace of execution, restartable pipelines, and replay with simulated timing — all from ordinary `async def`.
+Declarative graph frameworks (LangGraph, CrewAI, Airflow-style DAGs) force you
+into their node/edge DSL. Cairn goes the other way: the graph **is** your code,
+the framework just instruments it. From that you get:
 
-Works for agent pipelines, scrapers, ETL, or anything expressible as pure-ish async functions.
+- **Caching** keyed on `(function identity, body version, resolved args)` — change
+  one function, only its downstream re-executes.
+- **Tracing** — live, structured event log; a built-in TUI renders it.
+- **Resume** — a failed pipeline reruns from the last successful step.
+- **Replay** — cached runs can replay with original timing, indistinguishable
+  from a live execution.
+- **Human-in-the-loop** as a regular async step (`await_input(...)`).
+
+Works for LLM pipelines, scrapers, ETL, long-running research — anything that
+fits into mostly-pure async functions.
 
 ## Install
 
 ```sh
-uv pip install -e .
-# or with extras
-uv pip install -e ".[tui,pydantic]"
+uv pip install -e ".[tui]"     # TUI is worth having
+uv pip install -e ".[full]"    # TUI + pydantic hashing
 ```
 
 Requires Python 3.12+.
 
-## Example
+## Hello world
 
 ```python
 import asyncio
@@ -30,50 +49,82 @@ from cairn import step, run, trace
 
 @step(memo=True)
 async def fetch(url: str) -> str:
-    trace("fetching", url=url)
-    ...  # actual fetch
-    return html
+    trace("fetching", state="running")
+    await asyncio.sleep(0.2)       # pretend HTTP
+    return f"<html>{url}</html>"
 
 @step
-async def extract(html: str) -> list[str]:
-    return [...]
+async def extract(html: str) -> int:
+    return len(html)
 
-async def pipeline(urls: list[str]):
-    pages = await asyncio.gather(*[fetch(u) for u in urls])
-    return await asyncio.gather(*[extract(p) for p in pages])
+@step
+async def pipeline(urls: list[str]) -> list[int]:
+    pages = [fetch(u) for u in urls]              # returns Handles; runs concurrently
+    return [await extract(p) for p in pages]      # pages are awaited inside extract
 
-run(lambda: pipeline(["https://a", "https://b"]))
+run(pipeline, store_path=".cairn",
+    args=(["https://a", "https://b", "https://c"],))
 ```
 
-Second run is instant — every `@step(memo=True)` result is cached by `(function version, inputs)`. Change one function's body and only its downstream re-executes.
-
-See `examples/` for scrapers, research pipelines, failure/resume, and human-in-the-loop patterns.
+Run it twice. The second run is instant — every `@step(memo=True)` result is
+looked up by cache key. Edit the body of `extract`, rerun: only `extract`
+re-executes, fetches are cache hits.
 
 ## CLI
 
-Cairn ships a `cairn` command for locally running scripts and browsing cached runs.
-
 ```sh
-cairn examples/research_haiku.py          # run the pipeline (opens TUI if installed)
-cairn examples/research_haiku.py --force  # clear this entry point's cache, then run
-cairn                                     # interactive browser over past runs
-cairn gc [--before YYYY-MM-DD]            # garbage-collect old runs
+cairn examples/research_fake_llm.py        # run the pipeline, opens TUI if installed
+cairn examples/research_fake_llm.py slow   # run the `slow` entry point
+cairn examples/research_fake_llm.py -f     # clear this entry's cache, then run
+cairn                                      # interactive run browser over past runs
+cairn list                                 # flat list of runs
+cairn show [RUN_ID]                        # print a trace (latest if omitted)
+cairn gc [--before YYYY-MM-DD]             # garbage-collect old runs
 ```
 
-By default the store lives at `./.cairn/`. Override with `--store PATH` (or `-s`).
+Default store is `./.cairn/`. Override with `--store PATH` (or `-s`). Entry
+points default to a function named `main`; pass a second positional arg to
+pick another, e.g. `cairn script.py my_pipeline`.
 
-A script's entry point defaults to a function named `main`; pass a second positional arg to pick another (e.g. `cairn script.py my_pipeline`). The `examples/research_haiku.py` example aliases `main = pipeline`, so `cairn examples/research_haiku.py` runs the full research pipeline — the first run hits the Claude CLI, subsequent runs in the same ISO week are fully cached.
+## Examples
+
+Each example runs standalone with `python examples/<name>.py`, or through the
+CLI with `cairn examples/<name>.py` for the TUI.
+
+| Example | What it shows |
+|---------|---------------|
+| [`scraper.py`](examples/scraper.py) | Fan-out + chain, non-AI, fully mocked. Good first look. |
+| [`failure_resume.py`](examples/failure_resume.py) | A step fails on item 3; rerun resumes from cache. |
+| [`research_fake_llm.py`](examples/research_fake_llm.py) | Fan-out across N subjects, retry loop, rate limiting, simulated 20% API failure rate. No API key needed. |
+| [`hitl.py`](examples/hitl.py) | `await_input` inside a step — TUI input widget, stdin fallback. |
+| [`research_haiku.py`](examples/research_haiku.py) + [`claude.py`](examples/claude.py) | Live research over real AI companies via the `claude` CLI (Haiku). Cached by ISO week — re-runs within the week are free. |
+
+## What you'll see
+
+With `cairn[tui]` installed, the CLI opens a live span tree: each `@step`
+invocation is a row, child steps indent, `trace(...)` calls attach as
+annotations, and `cost={...}` kwargs get summed up the tree. Failures colour
+red, running steps pulse, completed steps show wall time + own time (excluding
+waits on children).
+
+Without the TUI, the same events stream to `.cairn/runs/{entry}-{ts}/trace.jsonl`
+and you can read them with `cairn show`.
 
 ## Docs
 
-- [`docs/motivation.md`](docs/motivation.md) — why this exists, what problem it solves
-- [`docs/design.md`](docs/design.md) — core abstractions (`@step`, `Handle`, `trace`, stores)
-- [`docs/patterns.md`](docs/patterns.md) — composable patterns (retry, validation loops, fan-out)
+- [`docs/motivation.md`](docs/motivation.md) — the problem and the analogy to PyTorch.
+- [`docs/design.md`](docs/design.md) — all primitives, event log, stores, plugin points.
+- [`docs/patterns.md`](docs/patterns.md) — comparison against Prefect, LangGraph, Temporal, Flyte, CrewAI across seven patterns.
 
 ## Status
 
-Alpha. Core primitives work and tests pass, but:
-- Public API names may still change (including the `@step` decorator itself).
-- On-disk cache format is not stable across versions.
-- No published releases — install from source.
-- Feedback and breakage reports welcome via issues.
+Alpha, but the core works:
+
+- `@step`, `Handle`, `trace`, `cached_output/tracing`, `replayable`, `rate_limited`, `await_input` all shipped.
+- File-backed content-addressed store, JSONL trace sink, symlinked run layout, GC.
+- Live TUI for span-tree viewing.
+- 96 tests, covering core + hashing + disk + resume + GC + metrics + patterns.
+
+Possible future work: a web UI, distributed execution, distributed cache store.
+
+Feedback and breakage reports welcome via issues.

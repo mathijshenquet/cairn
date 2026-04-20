@@ -500,8 +500,8 @@ The human ranking is just a flag. No prefill, no structured ranking UI. The loop
 
 ### Caveats and scoring honesty
 
-- **Cairn does not yet exist** — scores reflect design intent, not proven implementation. Every Cairn score should be read as "if implemented as designed."
-- **Observability scores for Cairn are low** (2-3) because we have a JSONL format, not a UI. Competitors like Temporal, Prefect, and Dagster have mature dashboards, alerting, and operational tooling. Cairn's observability *design* is sound but unproven.
+- **Cairn is alpha** — the primitives all work and are covered by tests, but API names, on-disk format, and higher-order wrappers may still change. Scores reflect observed behaviour, not a frozen 1.0.
+- **Observability scores for Cairn are middling** (3) because the TUI exists and renders the live span tree, but production tooling (web dashboards, alerting, long-term retention) is absent. Competitors like Temporal, Prefect, and Dagster have mature dashboards. Cairn's observability *core* is there; the ecosystem around it is not.
 - **Pattern selection is biased toward Cairn's strengths**: composability, caching, higher-order patterns. We did not evaluate patterns where competitors excel: streaming token output (LangGraph), distributed execution (Flyte/Dagster), durable long-running workflows (Temporal), asset lineage (Dagster).
 - **LangGraph's newer functional API is cleaner** than the verbose `StateGraph` construction shown here. Scores may be 1 point too low on clarity.
 - **Prefect is closer to Cairn than it looks.** A `@flow` with `@task` calls in a for-loop achieves a similar pattern. The main gaps are per-step caching granularity and the `.submit()` vs direct-call ergonomics.
@@ -511,9 +511,9 @@ The human ranking is just a flag. No prefill, no structured ranking UI. The loop
 
 ### Where Cairn is weakest
 
-- **Production observability**: we have a log format, not tooling. Competitors have years of UI/alerting investment. On the roadmap for v2.
-- **Ecosystem**: no existing integrations, UI, or community. Competitors have years of investment. Chicken-and-egg.
-- **Streaming**: no first-class support for streaming LLM token output. LangGraph handles this natively. Out of scope for Cairn.
+- **Production observability**: a JSONL log + a local TUI, no web dashboard, no alerting, no long-term retention. Competitors have years of UI investment. Addressable — `CompositeSink` already exists — but not yet built.
+- **Ecosystem**: no third-party integrations, no published web UI, no community. Chicken-and-egg.
+- **Streaming**: no first-class support for streaming LLM token output. LangGraph handles this natively. Out of scope — stream inside a step body, emit periodic `trace(..., progress=...)` if you want progress.
 
 ### Not real weaknesses (on inspection)
 

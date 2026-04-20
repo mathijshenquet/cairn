@@ -18,12 +18,11 @@ from cairn import rate_limited
 
 _delay: tuple[float, float] = (0.05, 0.15)
 _fail_rate: float = 0.0
-_api_sem: asyncio.Semaphore | None = None
 
-@rate_limited(n=5, memo=True)  # no memo — can fail, retried by llm wrapper
+
+@rate_limited(n=5, memo=True)  # concurrency-limited; retries handled by `llm` below
 async def fake_api_call(prompt: str) -> str:
-    """Simulates a API call. Fails ~20% of the time, rate limited."""
-    # Rate limit
+    """Simulates an API call. Fails `_fail_rate` of the time, rate limited."""
     trace(f"calling LLM API ({len(prompt)} chars)", state="running")
     await asyncio.sleep(random.uniform(*_delay))
 
@@ -163,10 +162,9 @@ async def pipeline(subjects: list[str] | None = None) -> dict[str, str]:
 @step
 async def pipeline_slow() -> dict[str, str]:
     """Full pipeline: 20 animals, 1-4s delays, 20% failure rate, rate limited to 5 concurrent."""
-    global _delay, _fail_rate, _api_sem  # noqa: PLW0603
+    global _delay, _fail_rate  # noqa: PLW0603
     _delay = (1.0, 4.0)
     _fail_rate = 0.2
-    _api_sem = asyncio.Semaphore(5)
     return await pipeline(ANIMALS_LARGE)
 
 slow = pipeline_slow

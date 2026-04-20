@@ -36,7 +36,7 @@ def serialize(value: Any) -> bytes:
     except (TypeError, ValueError) as e:
         raise TypeError(
             f"Cannot serialize type {type(value).__name__}. "
-            f"Register a serializer via configure(serializers={{...}})"
+            f"Register a serializer via register_serializer(...)"
         ) from e
 
 
