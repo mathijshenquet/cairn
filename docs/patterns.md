@@ -24,17 +24,17 @@ Process N items concurrently, collect results.
 ### Cairn
 
 ```python
-@_step
+@step
 async def process(item: str) -> str:
     return await claude(f"analyze {item}")
 
-@_step
+@step
 async def pipeline(items: list[str]) -> list[str]:
     handles = [process(item) for item in items]
     return [await h for h in handles]
 ```
 
-Concurrency is implicit — calling a `_step` returns a `Handle` immediately, the work runs in the background. No special `map` API, no task runner configuration. It's just Python list comprehensions.
+Concurrency is implicit — calling a `step` returns a `Handle` immediately, the work runs in the background. No special `map` API, no task runner configuration. It's just Python list comprehensions.
 
 ### Prefect
 
@@ -116,19 +116,19 @@ Generate, validate, refine in a loop.
 ### Cairn
 
 ```python
-@_step
+@step
 async def research(subject: str, spec: str) -> str:
     return await claude(f"research {subject} per {spec}")
 
-@_step
+@step
 async def validate(spec: str, report: str) -> dict:
     return json.loads(await claude(f"validate against {spec}: {report}"))
 
-@_step
+@step
 async def refine(draft: str, feedback: str) -> str:
     return await claude(f"improve: {draft}\nfeedback: {feedback}")
 
-@_step
+@step
 async def research_validated(subject: str, spec: str) -> str:
     draft = await research(subject, spec)
     for i in range(3):
@@ -219,12 +219,12 @@ Iterative refinement with human feedback.
 ### Cairn
 
 ```python
-@_step(memo=False)
+@step(memo=False)
 async def human_review(question: str) -> str:
     prev = cached_output()
     return await harness.ask(question, prefill=prev)
 
-@_step
+@step
 async def iterate_spec(initial_spec: str, sample_subject: str) -> str:
     spec = initial_spec
     for i in range(5):
@@ -424,22 +424,22 @@ Generate N candidates, have human rank them, use ranking to improve.
 ### Cairn
 
 ```python
-@_step
+@step
 async def generate_candidates(prompt: str, n: int) -> list[str]:
     handles = [claude(f"{prompt}\n(variation {i})") for i in range(n)]
     return [await h for h in handles]
 
-@_step(memo=False)
+@step(memo=False)
 async def human_rank(candidates: list[str]) -> list[int]:
     prev = cached_output()
     return await harness.rank(candidates, prefill=prev)
 
-@_step
+@step
 async def improve(prompt: str, ranked: list[str]) -> str:
     best = ranked[0]
     return await claude(f"improve on this:\n{best}\noriginal prompt: {prompt}")
 
-@_step
+@step
 async def rlhf_loop(prompt: str, rounds: int = 3) -> str:
     for i in range(rounds):
         trace("round", progress=(i + 1, rounds))

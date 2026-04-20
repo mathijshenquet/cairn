@@ -5,7 +5,7 @@ external code can say `from cairn.core import step` without knowing where
 each name lives.
 """
 
-from ._step import (
+from .step import (
     Handle,
     cached_output,
     cached_tracing,

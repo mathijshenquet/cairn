@@ -74,11 +74,11 @@ class TraceInspector:
     def child_events(self, parent_id: int, kind: str) -> list[Event]:
         """Get events of a given kind that are children of a span.
 
-        For join events, matches on the 'by' field (who awaited).
-        For other events, matches on parent_id.
+        For `wait` events (which fire on the awaiter), matches on event id
+        equal to parent_id. For other events, matches on parent_id.
         """
-        if kind == "join":
-            return [e for e in self._sink.events if e.kind == kind and e.by == parent_id]
+        if kind == "wait":
+            return [e for e in self._sink.events if e.kind == kind and e.id == parent_id]
         return [e for e in self._sink.events if e.kind == kind and e.parent_id == parent_id]
 
     def edge_annotations(self, parent_name: str) -> list[Event]:
@@ -127,7 +127,7 @@ class Runtime:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        from ._step import reset_store
+        from .step import reset_store
         from .context import reset_sink
 
         if self._store_token is not None:

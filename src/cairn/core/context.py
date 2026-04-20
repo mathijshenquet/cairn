@@ -36,7 +36,7 @@ def reset_id_counter() -> None:
 class Event:
     """A single event in the trace log."""
 
-    kind: str  # spawn, start, end, error, join, trace
+    kind: str  # spawn, start, end, error, cancel, wait, resume, trace, input_request, input_response
     id: int | None = None
     parent_id: int | None = None
     ts: float = 0.0

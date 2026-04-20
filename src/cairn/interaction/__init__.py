@@ -23,9 +23,10 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar, cast
 
 from cairn.core import cached_output, emit_event, next_id, step, trace
+from cairn.core.context import current_span
 
 T = TypeVar("T")
 
@@ -46,12 +47,18 @@ class InputRequest:
     `metadata` is a bag for UI hints (placeholder, multi-line, allowed
     values, etc.) that sinks can use without forcing them into the public
     signature.
+
+    `anchor_span` is the span that should host this request in a UI — the
+    span that called `await_input`, not the `_ask` step itself. Sinks use
+    it directly instead of reading `current_span` at request time, so replay
+    places widgets correctly from the event log alone.
     """
 
     id: int
     prompt: str
     default: Any = _SENTINEL
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=lambda: cast(dict[str, Any], {}))
+    anchor_span: int | None = None
 
     @property
     def has_default(self) -> bool:
@@ -99,20 +106,35 @@ async def _ask(prompt: str, schema_name: str, metadata: dict[str, Any]) -> Any:
         )
 
     prior = cached_output()
+    self_span = current_span.get()
+    # Anchor the UI widget on the caller of `await_input`, not on _ask itself.
+    # _ask is a caching wrapper; the caller owns the conversational context.
+    anchor = self_span.parent_id if self_span is not None else None
     req = InputRequest(
         id=next_id(),
         prompt=prompt,
         default=prior if prior is not None else _SENTINEL,
         metadata=metadata,
+        anchor_span=anchor,
     )
     emit_event(
         "input_request",
         id=req.id,
         message=prompt,
-        kwargs={"schema": schema_name, **metadata},
+        kwargs={"schema": schema_name, "by": anchor, **metadata},
     )
     trace("awaiting input", detail=prompt, state="awaiting")
-    response = await sink.request(req)
+    if self_span is not None:
+        emit_event(
+            "wait",
+            id=self_span.id,
+            kwargs={"on": {"kind": "input", "id": req.id}},
+        )
+    try:
+        response = await sink.request(req)
+    finally:
+        if self_span is not None:
+            emit_event("resume", id=self_span.id)
     trace("input received", state="done")
     emit_event("input_response", id=req.id)
     return response

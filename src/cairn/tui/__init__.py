@@ -18,16 +18,16 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
 from textual.widgets import Footer, Header, Input, Static
 from textual.widgets import Tree as TextualTree
+from textual.widgets.tree import TreeNode
 
 from cairn.core import Event, Handle, event_to_dict, set_sink, set_store
 from cairn.interaction import InputRequest, set_interaction_sink
 from cairn.run import CompositeSink, RunInfo, RunManager, SymlinkTracker, list_runs
 from cairn.run.show import TRACE_RESERVED, format_cost
+from cairn.run.spans import SpanGraph
 
 
-def _trace_style(level: str, state: str | None = None) -> str:
-    if state == "awaiting":
-        return "bold cyan"
+def _trace_style(level: str) -> str:
     if level == "error":
         return "red"
     if level == "warn":
@@ -63,7 +63,7 @@ def _render_trace_text(e: dict[str, Any]) -> Text:
         kv = " ".join(f"{k}={v}" for k, v in attrs.items())
         parts.append(f"({kv})")
 
-    return Text(" ".join(parts), style=_trace_style(level, state))
+    return Text(" ".join(parts), style=_trace_style(level))
 
 
 # ── Messages for pipeline events ──
@@ -127,13 +127,9 @@ class TuiInteractionSink:
         self._app = app
 
     async def request(self, req: InputRequest) -> Any:
-        from cairn.core.context import current_span
-
-        span = current_span.get()
-        span_id = span.id if span is not None else None
         fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
         self._app.call_from_thread(
-            self._app.post_message, InputRequestMessage(req, fut, span_id)
+            self._app.post_message, InputRequestMessage(req, fut, req.anchor_span)
         )
         return await asyncio.wrap_future(fut)
 
@@ -196,11 +192,13 @@ class CairnApp(App[None]):
         else:
             self._detail_plain = Text.from_markup(content).plain
 
-    # status ∈ {"pending", "running", "awaiting", "cached", "ok", "error", "cancelled"}
+    # Effective-status values rendered by `_render_label`. A superset of the
+    # raw Span.status: `awaiting_input` is propagated by
+    # `SpanGraph.effective_status` up the wait-chain.
     STATUS_ICONS: dict[str, tuple[str, str]] = {
         "pending": ("○", "dim"),
         "running": ("◉", "yellow"),
-        "awaiting": ("◐", "bold cyan"),
+        "awaiting_input": ("◐", "bold cyan"),
         "cached": ("⚡", "green"),
         "ok": ("✓", "green"),
         "error": ("✗", "red"),
@@ -209,19 +207,8 @@ class CairnApp(App[None]):
     TERMINAL_STATUSES = frozenset({"cached", "ok", "error", "cancelled"})
 
     def _reset_span_state(self) -> None:
-        self.span_names: dict[int, str] = {}
-        self.span_parents: dict[int, int | None] = {}
-        self.span_status: dict[int, str] = {}
-        self.span_start_times: dict[int, float] = {}
-        self.span_end_times: dict[int, float] = {}
-        self.span_spawn_times: dict[int, float] = {}
-        self.span_first_ts: float | None = None
-        self.span_tree_nodes: dict[int, Any] = {}
-        self.span_cache_keys: dict[int, str] = {}
-        self.span_args: dict[int, str] = {}
-        self.span_traces: dict[int, list[dict[str, Any]]] = {}
-        self.span_errors: dict[int, str] = {}
-        self.span_memo: set[int] = set()
+        self.graph: SpanGraph = SpanGraph()
+        self.span_tree_nodes: dict[int, TreeNode[str]] = {}
         self.highlighted_span: int | None = None
         # When the user navigates onto a specific trace node, remember which
         # trace to expand in the detail pane. Otherwise (span-level select),
@@ -231,12 +218,16 @@ class CairnApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="main"):
-            yield TextualTree("Cairn", id="tree")
+            yield TextualTree[str]("Cairn", id="tree")
             with VerticalScroll(id="detail-scroll"):
                 yield Static(id="detail")
         yield Footer()
 
-    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+    def check_action(
+        self,
+        action: str,
+        parameters: tuple[object, ...],  # pyright: ignore[reportUnusedParameter] -- name must match DOMNode override
+    ) -> bool | None:
         if action == "go_back":
             return True if self._current_run_id is not None else None
         return True
@@ -261,7 +252,7 @@ class CairnApp(App[None]):
         runs = list_runs(self._store_path)
         self._runs_by_id = {r.run_id: r for r in runs}
 
-        tree = self.query_one("#tree", TextualTree)
+        tree = self.query_one("#tree", TextualTree[str])
         tree.clear()
         tree.show_root = False
         tree.root.expand()
@@ -296,7 +287,7 @@ class CairnApp(App[None]):
         self._reset_span_state()
         self.sub_title = title
         self.refresh_bindings()
-        tree = self.query_one("#tree", TextualTree)
+        tree = self.query_one("#tree", TextualTree[str])
         tree.clear()
         tree.show_root = False
         tree.root.expand()
@@ -327,115 +318,106 @@ class CairnApp(App[None]):
     # ── Event handling (shared by live and replay) ──
 
     def _apply_event(self, e: dict[str, Any]) -> None:
-        """Mutate span state + tree in response to one event."""
-        kind: str = e["e"]
-        span_id: int = e.get("id", 0)
-        ts: float = e.get("ts", 0.0)
-
-        if self.span_first_ts is None:
-            self.span_first_ts = ts
-
-        tree = self.query_one("#tree", TextualTree)
+        """Feed an event into the SpanGraph and reflect the change in the tree."""
+        self.graph.apply(e)
+        kind: str = e.get("e", "")
+        tree = self.query_one("#tree", TextualTree[str])
 
         if kind == "spawn":
-            name = e.get("name", "?")
-            args_str: str = e.get("args", "")
-            is_memo: bool = e.get("memo", False)
-            self.span_names[span_id] = name
-            self.span_parents[span_id] = e.get("parent")
-            self.span_args[span_id] = args_str
-            self.span_traces[span_id] = []
-            self.span_spawn_times[span_id] = ts
-            self.span_status[span_id] = "pending"
-            if is_memo:
-                self.span_memo.add(span_id)
-
-            parent_id = self.span_parents.get(span_id)
-            parent_node = self.span_tree_nodes.get(parent_id) if parent_id is not None else None  # type: ignore[arg-type]
+            span_id = int(e["id"])
+            parent_id = e.get("parent")
+            parent_node = (
+                self.span_tree_nodes.get(int(parent_id))
+                if parent_id is not None
+                else None
+            )
             if parent_node is None:
                 parent_node = tree.root
-
             node = parent_node.add(self._render_label(span_id), data=f"span:{span_id}")
             node.expand()
             self.span_tree_nodes[span_id] = node
 
         elif kind == "start":
-            self.span_start_times[span_id] = ts
-            self.span_status[span_id] = "running"
-            self._set_label(span_id)
+            self._refresh_label_chain(int(e["id"]))
 
         elif kind == "end":
-            cached = e.get("cached", False)
-            cache_key = e.get("cache_key")
-            if cache_key:
-                self.span_cache_keys[span_id] = cache_key
-            self.span_end_times[span_id] = ts
-            self.span_status[span_id] = "cached" if cached else "ok"
-            dur = ""
-            if span_id in self.span_start_times:
-                dur = self._format_duration(ts - self.span_start_times[span_id])
-            suffix = f"cached {dur}".strip() if cached else dur
+            span_id = int(e["id"])
+            s = self.graph.spans.get(span_id)
+            dur_str = ""
+            if s is not None and s.start_ts is not None and s.end_ts is not None:
+                dur_str = self._format_duration(s.end_ts - s.start_ts)
+            cached = s is not None and s.status == "cached"
+            suffix = (f"cached {dur_str}".strip() if cached else dur_str)
             self._set_label(span_id, suffix)
             if cached:
                 node = self.span_tree_nodes.get(span_id)
                 if node is not None:
                     node.remove_children()
                     node.allow_expand = False
+            self._refresh_label_chain(span_id, include_self=False)
 
         elif kind == "error":
-            full_err = str(e.get("err", "error"))
-            self.span_errors[span_id] = full_err
-            self.span_end_times[span_id] = ts
-            self.span_status[span_id] = "error"
-            short = full_err if len(full_err) <= 50 else full_err[:47] + "..."
+            span_id = int(e["id"])
+            s = self.graph.spans.get(span_id)
+            err = (s.error if s is not None else None) or "error"
+            short = err if len(err) <= 50 else err[:47] + "..."
             self._set_label(span_id, short)
+            self._refresh_label_chain(span_id, include_self=False)
 
         elif kind == "cancel":
-            self.span_end_times[span_id] = ts
-            self.span_status[span_id] = "cancelled"
+            span_id = int(e["id"])
             self._set_label(span_id, "cancelled")
+            self._refresh_label_chain(span_id, include_self=False)
 
         elif kind == "trace":
-            parent_id = e.get("parent", 0)
-            msg_text = e.get("msg", "")
-
-            trace_idx: int | None = None
-            if parent_id in self.span_traces:
-                self.span_traces[parent_id].append({"msg": msg_text, "ts": ts, **e})
-                trace_idx = len(self.span_traces[parent_id]) - 1
-
-            parent_node = self.span_tree_nodes.get(parent_id)
+            parent_id = e.get("parent")
+            if parent_id is None:
+                return
+            parent_node = self.span_tree_nodes.get(int(parent_id))
             if parent_node is None:
                 return
-
-            display = _render_trace_text(e)
+            s = self.graph.spans.get(int(parent_id))
+            trace_idx = (len(s.traces) - 1) if s is not None else -1
+            rec = s.traces[-1] if s is not None and s.traces else {}
+            display = _render_trace_text(rec)
             if display.plain:
                 node_data = (
                     f"trace:{parent_id}:{trace_idx}"
-                    if trace_idx is not None
+                    if trace_idx >= 0
                     else f"span:{parent_id}"
                 )
                 parent_node.add(display, data=node_data, allow_expand=False)
 
-        # Refresh detail if the event's subject (the span itself, or for
-        # traces its parent) is the highlighted span — or a direct child of it.
+        elif kind in ("wait", "resume"):
+            self._refresh_label_chain(int(e["id"]))
+
+        # Refresh detail if the highlighted span (or a direct child) changed.
         if self.highlighted_span is not None:
-            subject = e.get("parent", 0) if kind == "trace" else span_id
-            if (
-                subject == self.highlighted_span
-                or self.span_parents.get(subject) == self.highlighted_span
-            ):
-                self._refresh_detail(self.highlighted_span)
+            subject: int | None
+            if kind == "trace":
+                parent = e.get("parent")
+                subject = int(parent) if parent is not None else None
+            else:
+                sid = e.get("id")
+                subject = int(sid) if sid is not None else None
+            if subject is not None:
+                subj_span = self.graph.spans.get(subject)
+                if (
+                    subject == self.highlighted_span
+                    or (subj_span is not None and subj_span.parent == self.highlighted_span)
+                ):
+                    self._refresh_detail(self.highlighted_span)
 
     def _render_label(
         self, span_id: int, suffix: str = "", status: str | None = None
     ) -> Text:
         """Build a tree/timeline label for a span at its current (or given) status."""
+        s = self.graph.spans.get(span_id)
         if status is None:
-            status = self.span_status.get(span_id, "pending")
-        icon, style = self.STATUS_ICONS[status]
-        name = self.span_names.get(span_id, f"task-{span_id}")
-        args_str = self.span_args.get(span_id, "")
+            status = self.graph.effective_status(span_id) if s is not None else "pending"
+        icon, style = self.STATUS_ICONS.get(status, self.STATUS_ICONS["pending"])
+        name = s.name if s is not None else f"task-{span_id}"
+        args_str = s.args if s is not None else ""
         label = Text()
         label.append(f"{icon} ", style=style)
         label.append(name, style="bold" if style != "dim" else "dim")
@@ -450,54 +432,55 @@ class CairnApp(App[None]):
         if node is not None:
             node.set_label(self._render_label(span_id, suffix))
 
+    def _refresh_label_chain(self, span_id: int, include_self: bool = True) -> None:
+        """Refresh labels on a span and all its ancestors.
+
+        Any status transition on a descendant can change an ancestor's
+        effective_status (via wait-chain propagation), so ancestors need
+        relabeling whenever their subtree's status shifts.
+        """
+        if include_self:
+            self._set_label(span_id)
+        cur = self.graph.spans.get(span_id)
+        while cur is not None and cur.parent is not None:
+            self._set_label(cur.parent)
+            cur = self.graph.spans.get(cur.parent)
+
     def _format_duration(self, seconds: float) -> str:
         if seconds < 1:
             return f"{seconds * 1000:.0f}ms"
         return f"{seconds:.1f}s"
 
-    def _rolled_cost(self, span_id: int) -> dict[str, float]:
-        """Sum `cost` columns over this span's traces + all descendants."""
-        total: dict[str, float] = {}
-        for t in self.span_traces.get(span_id, []):
-            cost = t.get("cost")
-            if isinstance(cost, dict):
-                for k, v in cost.items():
-                    if isinstance(v, (int, float)):
-                        total[k] = total.get(k, 0) + v
-        for child_id, parent_id in self.span_parents.items():
-            if parent_id == span_id:
-                for k, v in self._rolled_cost(child_id).items():
-                    total[k] = total.get(k, 0) + v
-        return total
-
     def _refresh_detail(self, span_id: int) -> None:
-        status = self.span_status.get(span_id, "pending")
+        s = self.graph.spans.get(span_id)
+        if s is None:
+            self._update_detail("")
+            return
+        status = self.graph.effective_status(span_id)
 
         # Header: span label + duration if terminal
         suffix = ""
-        if status in self.TERMINAL_STATUSES and span_id in self.span_start_times:
-            dur = self.span_end_times.get(span_id, 0) - self.span_start_times[span_id]
+        if status in self.TERMINAL_STATUSES and s.start_ts is not None and s.end_ts is not None:
+            dur = s.end_ts - s.start_ts
             if dur > 0:
                 suffix = f"{dur:.3f}s"
         out = Text()
         out.append(self._render_label(span_id, suffix))
         out.append("\n\n")
 
-        if status == "error":
-            err = self.span_errors.get(span_id, "")
-            if err:
-                out.append("Error:\n", style="bold red")
-                out.append(f"{err}\n\n", style="red")
+        if status == "error" and s.error:
+            out.append("Error:\n", style="bold red")
+            out.append(f"{s.error}\n\n", style="red")
 
-        rolled = self._rolled_cost(span_id)
+        rolled = self.graph.rolled_cost(span_id)
         if rolled:
             out.append("Cost: ", style="bold")
             out.append(format_cost(rolled) + "\n\n", style="dim")
 
-        traces = self.span_traces.get(span_id, [])
+        traces = s.traces
 
         # Result (from cached output) — acts as the virtual last trace.
-        cache_key = self.span_cache_keys.get(span_id)
+        cache_key = s.cache_key
         result_str: str | None = None
         if cache_key and status in ("ok", "cached"):
             output_path = os.path.join(self._store_path, "outputs", f"{cache_key}.json")
@@ -527,22 +510,23 @@ class CairnApp(App[None]):
             detail_str: str | None = str(detail_raw) if detail_raw else None
             timeline.append((ts, label, "trace", i, detail_str))
 
-        children = [sid for sid, pid in self.span_parents.items() if pid == span_id]
-        for cid in children:
-            cstatus = self.span_status.get(cid, "pending")
-            if cid in self.span_start_times:
+        for cid in self.graph.children(span_id):
+            cs = self.graph.spans.get(cid)
+            if cs is None:
+                continue
+            cstatus = self.graph.effective_status(cid)
+            if cs.start_ts is not None:
                 timeline.append(
-                    (self.span_start_times[cid], self._render_label(cid, status="running"),
+                    (cs.start_ts, self._render_label(cid, status="running"),
                      "child", None, None)
                 )
-            if cstatus in self.TERMINAL_STATUSES:
-                end_ts = self.span_end_times.get(cid, 0.0)
-                start_ts = self.span_start_times.get(cid, end_ts)
-                dur = end_ts - start_ts
+            if cstatus in self.TERMINAL_STATUSES and cs.end_ts is not None:
+                start_ts = cs.start_ts if cs.start_ts is not None else cs.end_ts
+                dur = cs.end_ts - start_ts
                 dur_str = f"{dur:.3f}s" if dur > 0.001 else ""
                 extra = f"cached {dur_str}".strip() if cstatus == "cached" else dur_str
                 timeline.append(
-                    (end_ts, self._render_label(cid, extra, status=cstatus),
+                    (cs.end_ts, self._render_label(cid, extra, status=cstatus),
                      "child", None, None)
                 )
 
@@ -561,11 +545,18 @@ class CairnApp(App[None]):
                     for line in detail_str.splitlines() or [detail_str]:
                         out.append(f"{prefix_pad}{line}\n", style="dim")
 
-            # Virtual "Result" entry at the bottom — always expanded.
+            # Mark completion in the timeline (aligned with the gutter), then
+            # surface the Result as a flush-left section below — intentionally
+            # unaligned with the trace column so long results aren't squeezed.
+            if status in ("ok", "cached") and s.end_ts is not None:
+                elapsed = s.end_ts - base_ts
+                out.append(f"  {elapsed:7.3f}s  ")
+                out.append("Completed\n", style="bold")
+
             if result_str is not None:
-                out.append("  " + " " * 9 + "Result\n", style="bold")
+                out.append("\nResult:\n", style="bold")
                 for line in result_str.splitlines() or [result_str]:
-                    out.append(f"{prefix_pad}{line}\n")
+                    out.append(f"{line}\n")
 
         self._update_detail(out)
         self._sync_input_visibility(span_id)
@@ -671,14 +662,10 @@ class CairnApp(App[None]):
         if event.error:
             self._update_detail(f"[red]Error: {event.error}[/red]")
             self.notify(f"Failed: {event.error}", severity="error")
-        else:
-            result_str = str(event.result)
-            if len(result_str) > 1000:
-                result_str = result_str[:997] + "..."
-            self._update_detail(
-                f"[green]Pipeline complete[/green]\n\n[bold]Result:[/bold]\n{result_str}"
-            )
-            self.notify("Pipeline complete")
+            return
+        self.notify("Pipeline complete")
+        # Leave the tree cursor and detail pane where the user put them —
+        # the Result is always reachable by highlighting the root span.
 
     def action_copy_detail(self) -> None:
         if self._detail_plain:
@@ -705,14 +692,18 @@ class CairnApp(App[None]):
         )
         if msg.span_id is not None:
             self._pending_input_widgets[msg.span_id] = widget
-            if msg.span_id in self.span_status:
-                self.span_status[msg.span_id] = "awaiting"
-                self._set_label(msg.span_id)
         scroll.mount(widget)
         visible = msg.span_id is None or self.highlighted_span == msg.span_id
         widget.display = visible
         if visible:
             widget.focus()
+        elif msg.span_id is not None and not isinstance(self.focused, Input):
+            # Not currently editing an input — navigate to this span so the
+            # new widget gets focus via the highlight → _sync_input_visibility
+            # chain. Skipped if the user is already typing somewhere.
+            node = self.span_tree_nodes.get(msg.span_id)
+            if node is not None:
+                self.query_one("#tree", TextualTree[str]).select_node(node)
 
     @on(Input.Submitted)
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -728,6 +719,40 @@ class CairnApp(App[None]):
                 del self._pending_input_widgets[sid]
                 break
         event.input.remove()
+
+        # Refocus: next pending input in tree DFS order, else the tree itself.
+        tree = self.query_one("#tree", TextualTree[str])
+        next_span = self._next_pending_input_span()
+        if next_span is not None:
+            node = self.span_tree_nodes.get(next_span)
+            if node is not None:
+                # Selecting moves the cursor, which fires NodeHighlighted →
+                # _sync_input_visibility focuses the pending Input for us.
+                tree.select_node(node)
+                return
+        tree.focus()
+
+    def _next_pending_input_span(self) -> int | None:
+        """Next span awaiting input, in DFS tree order, cycling past current."""
+        if not self._pending_input_widgets:
+            return None
+        tree = self.query_one("#tree", TextualTree[str])
+        order: list[int] = []
+        stack: list[TreeNode[str]] = list(reversed(list(tree.root.children)))
+        while stack:
+            node = stack.pop()
+            data = node.data
+            if data is not None and data.startswith("span:"):
+                sid = int(data[5:])
+                if sid in self._pending_input_widgets:
+                    order.append(sid)
+            stack.extend(reversed(list(node.children)))
+        if not order:
+            return None
+        if self.highlighted_span in order:
+            i = order.index(self.highlighted_span)
+            return order[(i + 1) % len(order)]
+        return order[0]
 
     def _sync_input_visibility(self, span_id: int | None) -> None:
         """Show only the pending Input widget belonging to span_id (if any)."""

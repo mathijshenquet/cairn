@@ -180,6 +180,7 @@ from .gc import (  # noqa: E402
     remove_runs_before,
 )
 from .show import show_output, show_runs, show_trace  # noqa: E402
+from .spans import SpanGraph  # noqa: E402
 
 __all__ = [
     "RunManager",
@@ -195,4 +196,5 @@ __all__ = [
     "show_trace",
     "show_runs",
     "show_output",
+    "SpanGraph",
 ]

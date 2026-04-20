@@ -7,7 +7,7 @@ from typing import Awaitable, Callable, ParamSpec, TypeVar
 
 import asyncio
 
-from ._step import Handle, cached_output, cached_tracing, step, trace
+from .step import Handle, cached_output, cached_tracing, step, trace
 from .types import Identity, TraceRecord, Version
 
 P = ParamSpec("P")

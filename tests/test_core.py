@@ -222,8 +222,8 @@ async def test_trace_has_correct_parent():
 
 
 @pytest.mark.asyncio
-async def test_spawn_and_join_events():
-    """Handle creation emits spawn; awaiting emits join."""
+async def test_spawn_and_wait_events():
+    """Handle creation emits spawn; awaiting emits wait (and resume)."""
 
     @step
     async def child() -> int:
@@ -237,18 +237,25 @@ async def test_spawn_and_join_events():
     async with Runtime() as rt:
         await parent()
         spawns = rt.trace.events(kind="spawn")
-        joins = rt.trace.events(kind="join")
+        waits = rt.trace.events(kind="wait")
 
         # parent spawns, child spawns (from parent)
         assert len(spawns) == 2
-        # child is joined by parent
-        child_joins = [j for j in joins if rt.trace.span_name(j.id) == "child"]
-        assert len(child_joins) == 1
+        # parent emits a `wait` on the child span
+        parent_span = rt.trace.span("parent")
+        child_span = rt.trace.span("child")
+        span_waits = [
+            w for w in waits
+            if w.id == parent_span.id
+            and w.kwargs.get("on", {}).get("kind") == "span"
+            and w.kwargs.get("on", {}).get("id") == child_span.id
+        ]
+        assert len(span_waits) == 1
 
 
 @pytest.mark.asyncio
 async def test_fanout_detected_in_trace():
-    """Multiple spawns without intervening joins constitute a fan-out."""
+    """Multiple spawns without intervening waits constitute a fan-out."""
 
     @step
     async def leaf(x: int) -> int:
@@ -263,12 +270,17 @@ async def test_fanout_detected_in_trace():
         await root()
         root_span = rt.trace.span("root")
         child_spawns = rt.trace.child_events(root_span.id, kind="spawn")
-        child_joins = rt.trace.child_events(root_span.id, kind="join")
+        # `wait` events fire on the awaiter (root), one per child await.
+        root_waits = [
+            w for w in rt.trace.events(kind="wait")
+            if w.id == root_span.id
+            and w.kwargs.get("on", {}).get("kind") == "span"
+        ]
 
-        # 5 spawns happened before any joins
+        # 5 spawns happened before any waits
         assert len(child_spawns) == 5
-        assert len(child_joins) == 5
-        assert child_spawns[-1].ts < child_joins[0].ts
+        assert len(root_waits) == 5
+        assert child_spawns[-1].ts < root_waits[0].ts
 
 
 # ── Cached output and tracing ──

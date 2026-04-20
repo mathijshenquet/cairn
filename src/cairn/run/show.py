@@ -15,6 +15,7 @@ from typing import Any
 
 from cairn.core import Event
 from .gc import list_runs
+from .spans import SpanGraph
 
 
 # ── ANSI colors ──
@@ -109,21 +110,7 @@ class LiveRenderer:
 
     def __init__(self, file: Any = None) -> None:
         self._out = file or sys.stderr
-        self._names: dict[int, str] = {}
-        self._parents: dict[int, int | None] = {}
-        self._start_times: dict[int, float] = {}
-        self._first_ts: float | None = None
-
-    def _depth(self, span_id: int) -> int:
-        d = 0
-        current = span_id
-        while current in self._parents and self._parents[current] is not None:
-            d += 1
-            parent = self._parents[current]
-            if parent is None:
-                break
-            current = parent
-        return d
+        self.graph: SpanGraph = SpanGraph()
 
     def _print(self, msg: str) -> None:
         self._out.write(msg + "\n")
@@ -131,66 +118,69 @@ class LiveRenderer:
 
     def render_event(self, e: dict[str, Any]) -> None:
         """Render a single event dict (from JSONL or converted from Event)."""
-        kind: str = e["e"]
-        span_id: int = e.get("id", 0)
+        t = self.graph.apply(e)
+        kind = t.kind
+        ts: float = e.get("ts", 0.0)
+        relative_ts: float = ts - (self.graph.first_ts or 0.0)
 
-        if self._first_ts is None:
-            self._first_ts = e.get("ts", 0.0)
-        relative_ts: float = e.get("ts", 0.0) - (self._first_ts or 0.0)
+        def name_of(sid: int) -> str:
+            s = self.graph.spans.get(sid)
+            return s.name if s is not None else f"task-{sid}"
+
+        def indent_for(sid: int) -> str:
+            return "  " * self.graph.depth(sid)
 
         if kind == "spawn":
-            name: str = e.get("name", "?")
-            args_str: str = e.get("args", "")
-            self._names[span_id] = name
-            self._parents[span_id] = e.get("parent")
-            d = self._depth(span_id)
-            indent = "  " * d
+            span_id = t.span_id
+            if span_id is None:
+                return
+            s = self.graph.spans.get(span_id)
+            args_display = f"({s.args})" if s is not None and s.args else ""
             icon = _color("○", _DIM)
-            args_display = f"({args_str})" if args_str else ""
-            self._print(f"  {relative_ts:8.3f}s {indent}{icon} {_BOLD}{name}{_RESET}{_DIM}{args_display}{_RESET}")
+            self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {_BOLD}{name_of(span_id)}{_RESET}{_DIM}{args_display}{_RESET}")
 
         elif kind == "start":
-            self._start_times[span_id] = e.get("ts", 0.0)
-            name = self._names.get(span_id, f"task-{span_id}")
-            d = self._depth(span_id)
-            indent = "  " * d
+            span_id = t.span_id
+            if span_id is None:
+                return
             icon = _color("◉", _YELLOW)
-            self._print(f"  {relative_ts:8.3f}s {indent}{icon} {name}")
+            self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {name_of(span_id)}")
 
         elif kind == "end":
-            name = self._names.get(span_id, f"task-{span_id}")
-            d = self._depth(span_id)
-            indent = "  " * d
-            cached = e.get("cached", False)
+            span_id = t.span_id
+            if span_id is None:
+                return
+            s = self.graph.spans.get(span_id)
+            cached = s is not None and s.status == "cached"
             duration = ""
-            if span_id in self._start_times:
-                dur = e.get("ts", 0.0) - self._start_times[span_id]
-                duration = f" ({dur:.3f}s)"
+            if s is not None and s.start_ts is not None and s.end_ts is not None:
+                duration = f" ({s.end_ts - s.start_ts:.3f}s)"
             if cached:
                 icon = _color("⚡", _GREEN)
-                self._print(f"  {relative_ts:8.3f}s {indent}{icon} {name} {_DIM}cached{_RESET}{duration}")
+                self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {name_of(span_id)} {_DIM}cached{_RESET}{duration}")
             else:
                 icon = _color("✓", _GREEN)
-                self._print(f"  {relative_ts:8.3f}s {indent}{icon} {name} done{duration}")
+                self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {name_of(span_id)} done{duration}")
 
         elif kind == "error":
-            name = self._names.get(span_id, f"task-{span_id}")
-            d = self._depth(span_id)
-            indent = "  " * d
-            err = e.get("err", "unknown error")
+            span_id = t.span_id
+            if span_id is None:
+                return
+            s = self.graph.spans.get(span_id)
+            err = (s.error if s is not None else None) or "unknown error"
             icon = _color("✗", _RED)
-            self._print(f"  {relative_ts:8.3f}s {indent}{icon} {name} {_color(str(err), _RED)}")
+            self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {name_of(span_id)} {_color(str(err), _RED)}")
 
         elif kind == "cancel":
-            name = self._names.get(span_id, f"task-{span_id}")
-            d = self._depth(span_id)
-            indent = "  " * d
+            span_id = t.span_id
+            if span_id is None:
+                return
             icon = _color("⊘", _DIM)
-            self._print(f"  {relative_ts:8.3f}s {indent}{icon} {name} {_color('cancelled', _DIM)}")
+            self._print(f"  {relative_ts:8.3f}s {indent_for(span_id)}{icon} {name_of(span_id)} {_color('cancelled', _DIM)}")
 
         elif kind == "trace":
-            parent_id: int = e.get("parent", 0)
-            d = self._depth(parent_id) + 1 if parent_id in self._parents else 1
+            parent_id = t.parent_id
+            d = (self.graph.depth(parent_id) + 1) if parent_id is not None else 1
             indent = "  " * d
             line, style_color = _format_trace(e)
             self._print(f"  {relative_ts:8.3f}s {indent}{style_color}{line}{_RESET}")

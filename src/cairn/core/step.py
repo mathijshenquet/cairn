@@ -63,18 +63,19 @@ class Handle(Generic[R]):
 
     def __await__(self) -> Generator[Any, Any, R]:
         awaiter = current_span.get()
-        emit_event(
-            "join",
-            id=self._span.id,
-            by=awaiter.id if awaiter else None,
-        )
         if awaiter is None:
             return (yield from self._task.__await__())
+        emit_event(
+            "wait",
+            id=awaiter.id,
+            kwargs={"on": {"kind": "span", "id": self._span.id}},
+        )
         awaiter.enter_await()
         try:
             result = yield from self._task.__await__()
         finally:
             awaiter.exit_await()
+            emit_event("resume", id=awaiter.id)
         return result
 
     def cancel(self) -> None:
@@ -160,7 +161,7 @@ def _compute_metrics(span: TaskSpan, *, size: int, own_size: int) -> SpanMetrics
     return SpanMetrics(size=size, own_size=own_size, time=wall, own_time=own_time)
 
 
-# ── _step decorator ──
+# ── step decorator ──
 
 
 def _resolve_identity(
@@ -322,10 +323,20 @@ def _make_step(
 
                 # Structured concurrency cleanup counts as await time on this
                 # span — the body has finished its work; this is just waiting.
-                if span.child_tasks:
+                if span.child_tasks and any(not t.done() for t in span.child_tasks):
+                    emit_event(
+                        "wait",
+                        id=span.id,
+                        kwargs={"on": {"kind": "group", "ids": list(span.child_span_ids)}},
+                    )
                     cleanup_start = time.monotonic()
+                    try:
+                        await asyncio.gather(*span.child_tasks, return_exceptions=True)
+                    finally:
+                        span.suspended_total += time.monotonic() - cleanup_start
+                        emit_event("resume", id=span.id)
+                elif span.child_tasks:
                     await asyncio.gather(*span.child_tasks, return_exceptions=True)
-                    span.suspended_total += time.monotonic() - cleanup_start
 
                 span.end_ts = time.monotonic()
                 wall = span.end_ts - span.start_ts
@@ -395,6 +406,7 @@ def _make_step(
         # Register with parent for structured concurrency
         if parent is not None:
             parent.child_tasks.append(task)
+            parent.child_span_ids.append(span.id)
 
         return Handle(span, task, args_summary, memo)
 

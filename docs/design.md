@@ -141,7 +141,7 @@ The decorator transforms the return type:
 P = ParamSpec("P")
 R = TypeVar("R")
 
-# _step: Callable[P, Awaitable[R]] → Callable[P, Handle[R]]
+# step: Callable[P, Awaitable[R]] → Callable[P, Handle[R]]
 ```
 
 This works with pyright via `ParamSpec`.

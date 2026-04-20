@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import builtins
 import hashlib
 import inspect
+import json
+import textwrap
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 
 class Identity:
@@ -49,20 +53,163 @@ class Identity:
         return f"Identity({self._value!r})"
 
 
+_UNRESOLVED = object()
+_MISSING = object()
+
+
+def _resolve_name(fn: Any, name: str) -> Any:
+    code = getattr(fn, "__code__", None)
+    if code is not None:
+        freevars = getattr(code, "co_freevars", ())
+        if name in freevars:
+            idx = freevars.index(name)
+            closure = getattr(fn, "__closure__", None)
+            if closure is not None and idx < len(closure):
+                try:
+                    return closure[idx].cell_contents
+                except ValueError:
+                    return _UNRESOLVED
+    globals_ = getattr(fn, "__globals__", None)
+    if isinstance(globals_, dict) and name in cast(dict[str, Any], globals_):
+        return cast(dict[str, Any], globals_)[name]
+    if hasattr(builtins, name):
+        return getattr(builtins, name)
+    return _UNRESOLVED
+
+
+def _resolve_attribute_chain(fn: Any, node: ast.Attribute) -> tuple[str, Any]:
+    parts: list[str] = []
+    cur: ast.AST = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if not isinstance(cur, ast.Name):
+        return "", _MISSING
+    parts.append(cur.id)
+    parts.reverse()
+    dotted = ".".join(parts)
+
+    value: Any = _resolve_name(fn, parts[0])
+    if value is _UNRESOLVED:
+        return dotted, _MISSING
+    for attr in parts[1:]:
+        try:
+            value = getattr(value, attr)
+        except AttributeError:
+            return dotted, _MISSING
+    return dotted, value
+
+
+def _collect_refs(tree: ast.AST, fn: Any) -> dict[str, Any]:
+    code = getattr(fn, "__code__", None)
+    local_names: set[str] = set(getattr(code, "co_varnames", ()))
+
+    refs: dict[str, Any] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            dotted, value = _resolve_attribute_chain(fn, node)
+            if dotted and dotted.split(".", 1)[0] not in local_names:
+                refs[dotted] = value
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in local_names or node.id in refs:
+                continue
+            value = _resolve_name(fn, node.id)
+            if value is not _UNRESOLVED:
+                refs.setdefault(node.id, value)
+    return refs
+
+
+def _encode_ref(name: str, value: Any, _seen: dict[int, "Version"]) -> str:
+    if value is _MISSING:
+        return f"{name}=<missing>"
+    if inspect.ismodule(value):
+        ver = getattr(value, "__version__", None)
+        if isinstance(ver, str):
+            return f"{name}=<module:{value.__name__}@{ver}>"
+        return f"{name}=<module:{value.__name__}>"
+    if inspect.isclass(value):
+        module = getattr(value, "__module__", "?")
+        qualname = getattr(value, "__qualname__", getattr(value, "__name__", "?"))
+        return f"{name}=<class:{module}:{qualname}>"
+    if inspect.isfunction(value) or inspect.ismethod(value):
+        sub = Version.from_function(value, _seen)
+        return f"{name}={sub.hash}"
+    if inspect.isbuiltin(value):
+        module = getattr(value, "__module__", "?")
+        qualname = getattr(value, "__qualname__", getattr(value, "__name__", "?"))
+        return f"{name}=<builtin:{module}:{qualname}>"
+    # Non-callable value: route through resolve_hashable so Path / partial /
+    # user-registered hashers apply. Degrade to a stable fallback on TypeError
+    # — AST refs include incidental module-level values the function may not
+    # actually depend on, so silent passthrough beats blocking decoration.
+    from .hash import resolve_hashable
+
+    try:
+        resolved = resolve_hashable(value)
+        return f"{name}={json.dumps(resolved, sort_keys=True, separators=(',', ':'))}"
+    except TypeError:
+        if callable(value):
+            module = getattr(value, "__module__", "?")
+            qualname = getattr(value, "__qualname__", getattr(value, "__name__", "?"))
+            return f"{name}=<callable:{module}:{qualname}>"
+        return f"{name}=<opaque:{type(value).__name__}>"
+
+
 class Version:
-    """Version identifier derived from function source."""
+    """Version identifier derived from function source + resolved refs."""
 
     def __init__(self, value: str) -> None:
         self._value = value
         self._hash = hashlib.sha256(value.encode()).hexdigest()
 
     @classmethod
-    def from_function(cls, fn: object) -> Version:
+    def from_function(cls, fn: object, _seen: dict[int, Version] | None = None) -> Version:
+        # Trust an already-attached Version — that's how @step exposes its
+        # (possibly user-overridden) version for callers like _hash_partial.
+        existing = getattr(fn, "version", None)
+        if isinstance(existing, Version):
+            return existing
+
+        # Peel @functools.wraps / @step wrappers so we hash the real body,
+        # not our own library source.
         try:
-            source = inspect.getsource(fn)  # type: ignore[arg-type]
-        except (OSError, TypeError):
-            source = f"<no source:{id(fn)}>"
-        return cls(source)
+            fn = inspect.unwrap(fn)  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            pass
+
+        if _seen is None:
+            _seen = {}
+        fn_id = id(fn)
+        if fn_id in _seen:
+            # Two cases collapse here: real cycle (sentinel is still in place
+            # from an in-flight call) or duplicate reference to an already-
+            # computed function (sentinel has been replaced with the real
+            # Version). Returning _seen[fn_id] gives the right answer for both.
+            return _seen[fn_id]
+        _seen[fn_id] = cls("<cycle>")
+
+        tree: ast.AST | None
+        try:
+            source = textwrap.dedent(inspect.getsource(fn))  # type: ignore[arg-type]
+            tree = ast.parse(source)
+        except (OSError, TypeError, SyntaxError):
+            code = getattr(fn, "__code__", None)
+            if code is not None:
+                source = f"<no-source:co_code={code.co_code.hex()}>"
+            else:
+                tp = type(fn)
+                source = f"<no-source:{tp.__module__}:{tp.__qualname__}>"
+            tree = None
+
+        parts: list[str] = [source]
+        if tree is not None:
+            refs = _collect_refs(tree, fn)
+            for name in sorted(refs):
+                parts.append(_encode_ref(name, refs[name], _seen))
+
+        result = cls("\n".join(parts))
+        _seen[fn_id] = result
+        return result
 
     @property
     def hash(self) -> str:
@@ -146,6 +293,7 @@ class TaskSpan:
     cached_tracing_value: list[TraceRecord] | None = field(default=None)
     last_trace_ts: float = field(default=0.0)
     child_tasks: list[asyncio.Task[Any]] = field(default_factory=lambda: [])
+    child_span_ids: list[int] = field(default_factory=lambda: [])  # parallel to child_tasks
     start_ts: float = field(default=0.0)
     end_ts: float = field(default=0.0)
     cached: bool = field(default=False)
