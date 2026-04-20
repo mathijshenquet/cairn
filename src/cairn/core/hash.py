@@ -71,32 +71,20 @@ def resolve_hashable(value: Any, _seen: dict[int, bool] | None = None) -> Any:
         finally:
             del _seen[vid]
 
-    if isinstance(value, frozenset):
-        fs = cast(frozenset[Any], value)
+
+    if isinstance(value, (frozenset, set)):
+        tag = "__frozenset__" if isinstance(value, frozenset) else "__set__"
+        fs = cast(set[Any] | frozenset[Any], value)
         _seen[vid] = True
         try:
             items = [resolve_hashable(v, _seen) for v in fs]
             items.sort(key=lambda x: json.dumps(x, sort_keys=True))
-            return {"__frozenset__": items}
-        finally:
-            del _seen[vid]
-
-    if isinstance(value, set):
-        s = cast(set[Any], value)
-        _seen[vid] = True
-        try:
-            items = [resolve_hashable(v, _seen) for v in s]
-            items.sort(key=lambda x: json.dumps(x, sort_keys=True))
-            return {"__set__": items}
+            return {tag: items}
         finally:
             del _seen[vid]
 
     for tp in type(value).__mro__:
         if tp in _hash_funcs:
-            # Trust the hasher's output verbatim — hashers that need to include
-            # nested non-primitive values call resolve_hashable themselves. This
-            # keeps output tags like {"__path__": ...} from getting wrapped a
-            # second time as {"__dict__": {"__path__": ...}}.
             return _hash_funcs[tp](value)
 
     raise TypeError(
