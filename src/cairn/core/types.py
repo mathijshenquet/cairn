@@ -14,45 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 
-class Identity:
-    """Stable identifier for a step function."""
-
-    def __init__(self, value: str) -> None:
-        self._value = value
-        self._hash = hashlib.sha256(value.encode()).hexdigest()
-
-    @classmethod
-    def from_function(cls, fn: object) -> Identity:
-        module = getattr(fn, "__module__", "<unknown>")
-        qualname = getattr(fn, "__qualname__", getattr(fn, "__name__", "<unknown>"))
-        return cls(f"{module}:{qualname}")
-
-    @property
-    def value(self) -> str:
-        return self._value
-
-    @property
-    def hash(self) -> str:
-        return self._hash
-
-    def short(self) -> str:
-        return self._hash[:8]
-
-    def long(self) -> str:
-        return self._value
-
-    def __hash__(self) -> int:
-        return hash(self._value)
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, Identity):
-            return self._value == other._value
-        return NotImplemented
-
-    def __repr__(self) -> str:
-        return f"Identity({self._value!r})"
-
-
 _UNRESOLVED = object()
 _MISSING = object()
 
@@ -119,7 +80,7 @@ def _collect_refs(tree: ast.AST, fn: Any) -> dict[str, Any]:
     return refs
 
 
-def _encode_ref(name: str, value: Any, _seen: dict[int, "Version"]) -> str:
+def _encode_ref(name: str, value: Any, _seen: dict[int, str]) -> str:
     if value is _MISSING:
         return f"{name}=<missing>"
     if inspect.ismodule(value):
@@ -132,8 +93,8 @@ def _encode_ref(name: str, value: Any, _seen: dict[int, "Version"]) -> str:
         qualname = getattr(value, "__qualname__", getattr(value, "__name__", "?"))
         return f"{name}=<class:{module}:{qualname}>"
     if inspect.isfunction(value) or inspect.ismethod(value):
-        sub = Version.from_function(value, _seen)
-        return f"{name}={sub.hash}"
+        sub = StepInfo.from_function(value, _seen=_seen)
+        return f"{name}={sub.version_hash}"
     if inspect.isbuiltin(value):
         module = getattr(value, "__module__", "?")
         qualname = getattr(value, "__qualname__", getattr(value, "__name__", "?"))
@@ -155,82 +116,110 @@ def _encode_ref(name: str, value: Any, _seen: dict[int, "Version"]) -> str:
         return f"{name}=<opaque:{type(value).__name__}>"
 
 
-class Version:
-    """Version identifier derived from function source + resolved refs."""
+def _derive_name(fn: Any) -> str:
+    """Module-qualified name for a function: `module:qualname`."""
+    module = getattr(fn, "__module__", "<unknown>")
+    qualname = getattr(fn, "__qualname__", getattr(fn, "__name__", "<unknown>"))
+    return f"{module}:{qualname}"
 
-    def __init__(self, value: str) -> None:
-        self._value = value
-        self._hash = hashlib.sha256(value.encode()).hexdigest()
+
+def _derive_body(fn: Any, _seen: dict[int, str] | None = None) -> str:
+    """Canonical body string: source + sorted resolved refs.
+
+    `_seen` dedupes work across a single walk. Cycle sentinel goes in on entry;
+    real body string replaces it on exit. Revisit returns `_seen[fn_id]` — the
+    cycle sentinel for an in-flight call, the real body for a completed one.
+    """
+    if _seen is None:
+        _seen = {}
+    fn_id = id(fn)
+    if fn_id in _seen:
+        return _seen[fn_id]
+    _seen[fn_id] = "<cycle>"
+
+    tree: ast.AST | None
+    try:
+        source = textwrap.dedent(inspect.getsource(fn))
+        tree = ast.parse(source)
+    except (OSError, TypeError, SyntaxError):
+        code = getattr(fn, "__code__", None)
+        if code is not None:
+            source = f"<no-source:co_code={code.co_code.hex()}>"
+        else:
+            tp_name = f"{type(fn).__module__}:{type(fn).__qualname__}"
+            source = f"<no-source:{tp_name}>"
+        tree = None
+
+    parts: list[str] = [source]
+    if tree is not None:
+        refs = _collect_refs(tree, fn)
+        for name in sorted(refs):
+            parts.append(_encode_ref(name, refs[name], _seen))
+
+    body = "\n".join(parts)
+    _seen[fn_id] = body
+    return body
+
+
+@dataclass(frozen=True)
+class StepInfo:
+    """Identification of a step: a nominal name + a structural fingerprint.
+
+    `name` answers "what function is this?" (module:qualname by default, stable
+    across edits). `body` answers "which implementation?" (source + resolved
+    refs). The two hashes are projections; `cache_key(args)` combines both.
+    """
+
+    name: str
+    body: str
+    identity_hash: str = field(init=False, repr=False, compare=False)
+    version_hash: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Precompute hashes once. Frozen-dataclass assignment goes through
+        # object.__setattr__. Hashes are derived from name/body so excluding
+        # them from eq/hash is just avoiding redundant work.
+        object.__setattr__(self, "identity_hash", hashlib.sha256(self.name.encode()).hexdigest())
+        object.__setattr__(self, "version_hash", hashlib.sha256(self.body.encode()).hexdigest())
 
     @classmethod
-    def from_function(cls, fn: object, _seen: dict[int, Version] | None = None) -> Version:
-        # Trust an already-attached Version — that's how @step exposes its
-        # (possibly user-overridden) version for callers like _hash_partial.
-        existing = getattr(fn, "version", None)
-        if isinstance(existing, Version):
+    def from_function(
+        cls,
+        fn: object,
+        *,
+        name: str | None = None,
+        body: str | None = None,
+        _seen: dict[int, str] | None = None,
+    ) -> StepInfo:
+        """Derive StepInfo from fn. `name` / `body` override their derivation.
+
+        Respects a pre-attached `.info` (how @step wrappers expose their, possibly
+        user-overridden, info to downstream hashers like `_hash_partial`).
+        Decorators are peeled via `inspect.unwrap` so the real body is hashed.
+        """
+        existing = getattr(fn, "info", None)
+        if isinstance(existing, StepInfo) and name is None and body is None:
             return existing
 
-        # Peel @functools.wraps / @step wrappers so we hash the real body,
-        # not our own library source.
         try:
-            fn = inspect.unwrap(fn)  # type: ignore[arg-type]
+            unwrapped: Any = inspect.unwrap(fn)  # type: ignore[arg-type]
         except (ValueError, TypeError):
-            pass
+            unwrapped = fn
 
-        if _seen is None:
-            _seen = {}
-        fn_id = id(fn)
-        if fn_id in _seen:
-            # Two cases collapse here: real cycle (sentinel is still in place
-            # from an in-flight call) or duplicate reference to an already-
-            # computed function (sentinel has been replaced with the real
-            # Version). Returning _seen[fn_id] gives the right answer for both.
-            return _seen[fn_id]
-        _seen[fn_id] = cls("<cycle>")
+        resolved_name = name if name is not None else _derive_name(unwrapped)
+        resolved_body = body if body is not None else _derive_body(unwrapped, _seen)
+        return cls(resolved_name, resolved_body)
 
-        tree: ast.AST | None
-        try:
-            source = textwrap.dedent(inspect.getsource(fn))  # type: ignore[arg-type]
-            tree = ast.parse(source)
-        except (OSError, TypeError, SyntaxError):
-            code = getattr(fn, "__code__", None)
-            if code is not None:
-                source = f"<no-source:co_code={code.co_code.hex()}>"
-            else:
-                tp = type(fn)
-                source = f"<no-source:{tp.__module__}:{tp.__qualname__}>"
-            tree = None
+    def short_version(self) -> str:
+        return self.version_hash[:8]
 
-        parts: list[str] = [source]
-        if tree is not None:
-            refs = _collect_refs(tree, fn)
-            for name in sorted(refs):
-                parts.append(_encode_ref(name, refs[name], _seen))
+    def cache_key(self, args: dict[str, Any]) -> str:
+        from .hash import compute_cache_key
 
-        result = cls("\n".join(parts))
-        _seen[fn_id] = result
-        return result
-
-    @property
-    def hash(self) -> str:
-        return self._hash
-
-    def short(self) -> str:
-        return self._hash[:8]
-
-    def long(self) -> str:
-        return self._hash
-
-    def __hash__(self) -> int:
-        return hash(self._hash)
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, Version):
-            return self._hash == other._hash
-        return NotImplemented
+        return compute_cache_key(self.identity_hash, self.version_hash, args)
 
     def __repr__(self) -> str:
-        return f"Version({self._hash[:8]})"
+        return f"StepInfo({self.name!r}, v={self.short_version()})"
 
 
 @dataclass
@@ -284,8 +273,7 @@ class TaskSpan:
     id: int
     parent_id: int | None
     name: str
-    identity: Identity
-    version: Version
+    info: StepInfo
 
     # Populated during execution
     traces: list[TraceRecord] = field(default_factory=lambda: [])

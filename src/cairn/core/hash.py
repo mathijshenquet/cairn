@@ -137,13 +137,13 @@ def _hash_path(p: Path) -> Any:
 
 
 def _hash_partial(p: "functools.partial[Any]") -> Any:
-    # Reuse Version.from_function so body edits to p.func invalidate. That
-    # also respects @step's attached .version (including user overrides).
-    from .types import Version
+    # Reuse StepInfo.from_function so body edits to p.func invalidate. That
+    # also respects @step's attached `.info` (including user overrides).
+    from .types import StepInfo
 
     return {
         "__partial__": {
-            "func": Version.from_function(p.func).hash,
+            "func": StepInfo.from_function(p.func).version_hash,
             "args": [resolve_hashable(a) for a in p.args],
             "keywords": {k: resolve_hashable(v) for k, v in p.keywords.items()},
         }

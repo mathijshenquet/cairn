@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 from pathlib import Path
 
@@ -176,9 +177,9 @@ def test_version_deterministic_across_calls():
     def f(a: int) -> int:
         return a + 1
 
-    v1 = Version.from_function(f)
-    v2 = Version.from_function(f)
-    assert v1.hash == v2.hash
+    v1 = StepInfo.from_function(f)
+    v2 = StepInfo.from_function(f)
+    assert v1.version_hash == v2.version_hash
 
 
 def test_version_changes_on_body_edit():
@@ -211,16 +212,16 @@ def test_version_resolves_module_constant():
     assert StepInfo.from_function(uses_magic).version_hash != StepInfo.from_function(uses_magic2).version_hash
 
 
-def test_version_trusts_attached_version_attr():
-    # A function with a pre-attached Version (like @step) should return it
+def test_stepinfo_trusts_attached_info():
+    # A function with a pre-attached StepInfo (like @step) should return it
     # verbatim, respecting user overrides.
-    override = Version("user-pinned-v1")
+    override = StepInfo(name="pinned", body="user-pinned-v1")
 
     def inner() -> None:
         pass
 
-    inner.version = override  # type: ignore[attr-defined]
-    assert Version.from_function(inner) is override
+    inner.info = override  # type: ignore[attr-defined]
+    assert StepInfo.from_function(inner) is override
 
 
 def test_version_unwraps_decorators():
@@ -254,8 +255,8 @@ def test_version_recursion_terminates_on_cycle():
     b.__globals__["_a_holder"] = _a_holder
 
     # Should not infinite-loop.
-    v = Version.from_function(a)
-    assert isinstance(v.hash, str)
+    v = StepInfo.from_function(a)
+    assert isinstance(v.version_hash, str)
 
 
 def test_version_picks_up_imported_function_body_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -343,11 +344,11 @@ def test_version_duplicate_ref_within_one_call_reuses_hash():
     caller.__globals__["helper"] = helper
     caller.__globals__["alias"] = alias
 
-    v = Version.from_function(caller)
+    v = StepInfo.from_function(caller)
     # Both refs resolve to the same function; expectation is both encode to
     # helper's hash, not one of them encoding as <cycle>.
-    cycle_marker_hash = Version("<cycle>").hash
-    assert cycle_marker_hash not in v._value, (  # pyright: ignore[reportPrivateUsage]
+    cycle_marker_hash = hashlib.sha256(b"<cycle>").hexdigest()
+    assert cycle_marker_hash not in v.body, (
         "duplicate reference to a non-cyclic function should not encode as <cycle>"
     )
 

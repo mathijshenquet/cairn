@@ -9,9 +9,8 @@ import time
 from typing import Any, Awaitable, Callable, Generator, Generic, ParamSpec, TypeVar, overload
 
 from .context import current_span, emit_event, next_id
-from .hash import compute_cache_key
 from .store import MemoryStore, Store
-from .types import CacheEntry, Identity, SpanMetrics, TaskSpan, TraceRecord, Version
+from .types import CacheEntry, SpanMetrics, StepInfo, TaskSpan, TraceRecord
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -54,8 +53,8 @@ class Handle(Generic[R]):
             parent_id=span.parent_id,
             name=span.name,
             kwargs={
-                "identity": span.identity.long(),
-                "version": span.version.short(),
+                "identity": span.info.name,
+                "version": span.info.short_version(),
                 "args": args_summary,
                 "memo": memo,
             },
@@ -164,40 +163,19 @@ def _compute_metrics(span: TaskSpan, *, size: int, own_size: int) -> SpanMetrics
 # ── step decorator ──
 
 
-def _resolve_identity(
-    identity: str | Identity | Callable[..., str | Identity] | None,
-    fn: object,
-) -> Identity:
-    if identity is None:
-        return Identity.from_function(fn)
-    if isinstance(identity, str):
-        return Identity(identity)
-    if isinstance(identity, Identity):
-        return identity
-    if callable(identity):
-        result = identity(fn)
-        if isinstance(result, str):
-            return Identity(result)
-        return result
-    return Identity.from_function(fn)
+StrOverride = str | Callable[..., str] | None
 
 
-def _resolve_version(
-    version: str | Version | Callable[..., str | Version] | None,
-    fn: object,
-) -> Version:
-    if version is None:
-        return Version.from_function(fn)
-    if isinstance(version, str):
-        return Version(version)
-    if isinstance(version, Version):
-        return version
-    if callable(version):
-        result = version(fn)
-        if isinstance(result, str):
-            return Version(result)
-        return result
-    return Version.from_function(fn)
+def _resolve_override(arg: StrOverride, fn: object) -> str | None:
+    """Turn an `identity=` or `version=` kwarg into a string override (or None
+    to mean "derive from fn")."""
+    if arg is None:
+        return None
+    if isinstance(arg, str):
+        return arg
+    if callable(arg):
+        return arg(fn)
+    return None
 
 
 def _bind_args(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -206,10 +184,6 @@ def _bind_args(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, 
     bound = sig.bind(*args, **kwargs)
     bound.apply_defaults()
     return dict(bound.arguments)
-
-
-IdentityArg = str | Identity | Callable[..., str | Identity] | None
-VersionArg = str | Version | Callable[..., str | Version] | None
 
 
 @overload
@@ -221,8 +195,8 @@ def step(
     fn: Callable[P, Awaitable[R]],
     *,
     memo: bool = ...,
-    identity: IdentityArg = ...,
-    version: VersionArg = ...,
+    identity: StrOverride = ...,
+    version: StrOverride = ...,
 ) -> Callable[P, Handle[R]]: ...
 
 
@@ -230,8 +204,8 @@ def step(
 def step(
     *,
     memo: bool = ...,
-    identity: IdentityArg = ...,
-    version: VersionArg = ...,
+    identity: StrOverride = ...,
+    version: StrOverride = ...,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Handle[R]]]: ...
 
 
@@ -239,14 +213,18 @@ def step(
     fn: Callable[..., Awaitable[Any]] | None = None,
     *,
     memo: bool = False,
-    identity: IdentityArg = None,
-    version: VersionArg = None,
+    identity: StrOverride = None,
+    version: StrOverride = None,
 ) -> Any:
     """Decorator that turns an async function into a tracked step.
 
     By default, the step always runs (memo=False) — suitable for orchestration.
     Use memo=True for expensive leaf operations (API calls, heavy computation)
     to cache results based on (identity, version, args).
+
+    `identity` / `version` override the derived name / body as strings. To
+    forward an existing `StepInfo` through a higher-order wrapper, pass
+    `identity=info.name, version=info.body`.
 
     Returns Handle[T] on call instead of awaiting directly.
     """
@@ -264,11 +242,14 @@ def _make_step(
     fn: Callable[..., Awaitable[Any]],
     *,
     memo: bool,
-    identity: str | Identity | Callable[..., str | Identity] | None,
-    version: str | Version | Callable[..., str | Version] | None,
+    identity: StrOverride,
+    version: StrOverride,
 ) -> Any:
-    _identity = _resolve_identity(identity, fn)
-    _version = _resolve_version(version, fn)
+    _info = StepInfo.from_function(
+        fn,
+        name=_resolve_override(identity, fn),
+        body=_resolve_override(version, fn),
+    )
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Handle[Any]:
@@ -277,8 +258,7 @@ def _make_step(
             id=next_id(),
             parent_id=parent.id if parent else None,
             name=fn.__name__,
-            identity=_identity,
-            version=_version,
+            info=_info,
         )
 
         async def run() -> Any:
@@ -299,7 +279,7 @@ def _make_step(
 
                 # Cache lookup
                 store = get_store()
-                key = compute_cache_key(_identity.hash, _version.hash, resolved)
+                key = _info.cache_key(resolved)
                 cached = store.get(key)
 
                 if cached is not None and cached.error is None:
@@ -368,7 +348,7 @@ def _make_step(
                 else:
                     # Store error for browsability (keyed to resolved args)
                     store = get_store()
-                    err_key = compute_cache_key(_identity.hash, _version.hash, resolved)
+                    err_key = _info.cache_key(resolved)
                     stored_error: Exception | None = exc if isinstance(exc, Exception) else None
                     wall = span.end_ts - span.start_ts
                     own_time = wall - span.suspended_total
@@ -414,7 +394,6 @@ def _make_step(
         return Handle(span, task, args_summary, memo)
 
     # Attach metadata
-    wrapper.identity = _identity  # type: ignore[attr-defined]
-    wrapper.version = _version  # type: ignore[attr-defined]
+    wrapper.info = _info  # type: ignore[attr-defined]
     wrapper.__wrapped__ = fn  # type: ignore[attr-defined]
     return wrapper

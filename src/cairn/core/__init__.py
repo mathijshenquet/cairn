@@ -38,7 +38,7 @@ from .patterns import rate_limited, replayable
 from .serial import deserialize, register_serializer, serialize
 from .sink import JSONLSink, event_to_dict
 from .store import FileStore, MemoryStore, Store, StoreStats
-from .types import CacheEntry, Identity, SpanMetrics, TaskSpan, TraceRecord, Version
+from .types import CacheEntry, SpanMetrics, StepInfo, TaskSpan, TraceRecord
 
 __all__ = [
     # decorator + Handle
@@ -83,8 +83,7 @@ __all__ = [
     "rate_limited",
     "replayable",
     # types
-    "Identity",
-    "Version",
+    "StepInfo",
     "TraceRecord",
     "CacheEntry",
     "SpanMetrics",

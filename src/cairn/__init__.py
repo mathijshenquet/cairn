@@ -2,9 +2,8 @@
 
 from cairn.core import (
     Handle,
-    Identity,
+    StepInfo,
     TraceRecord,
-    Version,
     cached_output,
     cached_tracing,
     rate_limited,
@@ -24,9 +23,8 @@ from cairn.run import (
 
 __all__ = [
     "Handle",
-    "Identity",
+    "StepInfo",
     "TraceRecord",
-    "Version",
     "cached_output",
     "cached_tracing",
     "gc",

@@ -8,7 +8,7 @@ from typing import Awaitable, Callable, ParamSpec, TypeVar
 import asyncio
 
 from .step import Handle, cached_output, cached_tracing, step, trace
-from .types import Identity, TraceRecord, Version
+from .types import StepInfo, TraceRecord
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -33,12 +33,8 @@ def replayable(fn: Callable[P, Awaitable[R]]) -> Callable[P, Handle[R]]:
             return prev
         return await fn(*args, **kwargs)
 
-    return step(
-        wrapper,
-        memo=False,
-        identity=Identity.from_function(fn),
-        version=Version.from_function(fn),
-    )
+    info = StepInfo.from_function(fn)
+    return step(wrapper, memo=False, identity=info.name, version=info.body)
 
 
 def rate_limited(n: int, memo: bool = False) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Handle[R]]]:
@@ -56,11 +52,7 @@ def rate_limited(n: int, memo: bool = False) -> Callable[[Callable[P, Awaitable[
                 trace("acquired slot", status="running")
                 return await fn(*args, **kwargs)
 
-        return step(
-            wrapper,
-            memo=memo,
-            identity=Identity.from_function(fn),
-            version=Version.from_function(fn),
-        )
+        info = StepInfo.from_function(fn)
+        return step(wrapper, memo=memo, identity=info.name, version=info.body)
 
     return decorator
