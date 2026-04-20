@@ -104,6 +104,30 @@ class CacheEntry:
     traces: list[TraceRecord]
     error: BaseException | None = None
     duration: float = 0.0
+    own_duration: float = 0.0
+
+
+@dataclass(frozen=True)
+class SpanMetrics:
+    """Size/time metrics emitted on a span's terminal event.
+
+    `own_size` excludes bytes deduplicated via a content-addressed layer (today
+    equal to `size`). `own_time` is wall time minus time spent awaiting child
+    Handles. Cached hits report `size = own_size = 0` (nothing was written).
+    """
+
+    size: int
+    own_size: int
+    time: float
+    own_time: float
+
+    def as_kwargs(self) -> dict[str, Any]:
+        return {
+            "size": self.size,
+            "own_size": self.own_size,
+            "time": self.time,
+            "own_time": self.own_time,
+        }
 
 
 @dataclass
@@ -125,6 +149,24 @@ class TaskSpan:
     start_ts: float = field(default=0.0)
     end_ts: float = field(default=0.0)
     cached: bool = field(default=False)
+
+    # Own-time tracking: wall time minus time spent awaiting child Handles.
+    # `suspend_count` counts active Handle awaits (≥1 = this span is suspended);
+    # `suspend_start` is the monotonic time the most-recent 0→1 transition began;
+    # `suspended_total` accumulates closed intervals when count returns to 0.
+    suspend_count: int = field(default=0)
+    suspend_start: float = field(default=0.0)
+    suspended_total: float = field(default=0.0)
+
+    def enter_await(self) -> None:
+        if self.suspend_count == 0:
+            self.suspend_start = time.monotonic()
+        self.suspend_count += 1
+
+    def exit_await(self) -> None:
+        self.suspend_count -= 1
+        if self.suspend_count == 0:
+            self.suspended_total += time.monotonic() - self.suspend_start
 
     def record_trace(self, message: str, kwargs: dict[str, Any]) -> None:
         now = time.monotonic()

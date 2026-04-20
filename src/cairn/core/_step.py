@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import time
 from typing import Any, Awaitable, Callable, Generator, Generic, ParamSpec, TypeVar, overload
 
 from .context import current_span, emit_event, next_id
 from .hash import compute_cache_key
 from .store import MemoryStore, Store
-from .types import CacheEntry, Identity, TaskSpan, TraceRecord, Version
+from .types import CacheEntry, Identity, SpanMetrics, TaskSpan, TraceRecord, Version
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -67,7 +68,14 @@ class Handle(Generic[R]):
             id=self._span.id,
             by=awaiter.id if awaiter else None,
         )
-        return self._task.__await__()
+        if awaiter is None:
+            return (yield from self._task.__await__())
+        awaiter.enter_await()
+        try:
+            result = yield from self._task.__await__()
+        finally:
+            awaiter.exit_await()
+        return result
 
     def cancel(self) -> None:
         """Cancel the underlying task."""
@@ -132,6 +140,24 @@ def cached_tracing() -> list[TraceRecord] | None:
     if span is None:
         return None
     return span.cached_tracing_value
+
+
+# ── metrics ──
+
+
+def _compute_metrics(span: TaskSpan, *, size: int, own_size: int) -> SpanMetrics:
+    """Build a SpanMetrics for a span whose `start_ts`/`end_ts` are set.
+
+    Invariant: `suspended_total <= wall`. Violation means Handle.enter_await
+    and exit_await got unbalanced — a real bug worth surfacing.
+    """
+    wall = span.end_ts - span.start_ts
+    assert span.suspended_total <= wall + 1e-9, (
+        f"suspended_total ({span.suspended_total}) exceeds wall ({wall}) on "
+        f"span {span.name!r} — enter/exit_await is unbalanced"
+    )
+    own_time = max(0.0, wall - span.suspended_total)  # clamp FP slop
+    return SpanMetrics(size=size, own_size=own_size, time=wall, own_time=own_time)
 
 
 # ── _step decorator ──
@@ -256,9 +282,13 @@ def _make_step(
 
         async def run() -> Any:
             token = current_span.set(span)
+            span.start_ts = time.monotonic()
+            span.last_trace_ts = span.start_ts
             resolved: dict[str, Any] = {}
             try:
-                # Resolve Handle arguments
+                # Resolve Handle arguments (awaits here count toward
+                # suspended_total via Handle.__await__, so they don't bleed
+                # into own_time).
                 bound = _bind_args(fn, args, kwargs)
                 for k, v in bound.items():
                     if isinstance(v, Handle):
@@ -276,49 +306,71 @@ def _make_step(
                     span.cached_tracing_value = cached.traces
                     if memo:
                         span.cached = True
-                        emit_event("end", id=span.id, cached=True, kwargs={"cache_key": key})
+                        span.end_ts = time.monotonic()
+                        metrics = _compute_metrics(span, size=0, own_size=0)
+                        emit_event(
+                            "end",
+                            id=span.id,
+                            cached=True,
+                            kwargs={"cache_key": key, **metrics.as_kwargs()},
+                        )
                         return cached.result
 
                 # Execute the step body
-                import time
-                span.start_ts = time.monotonic()
-                span.last_trace_ts = span.start_ts
                 emit_event("start", id=span.id)
-
                 result = await fn(**resolved)
 
-                # Structured concurrency: wait for all child tasks
-                # (children spawned during execution, may or may not have been awaited)
+                # Structured concurrency cleanup counts as await time on this
+                # span — the body has finished its work; this is just waiting.
                 if span.child_tasks:
+                    cleanup_start = time.monotonic()
                     await asyncio.gather(*span.child_tasks, return_exceptions=True)
+                    span.suspended_total += time.monotonic() - cleanup_start
 
                 span.end_ts = time.monotonic()
-                emit_event("end", id=span.id, kwargs={"cache_key": key})
+                wall = span.end_ts - span.start_ts
+                own_time = wall - span.suspended_total
 
                 # Store result
-                store.put(key, CacheEntry(
+                stats = store.put(key, CacheEntry(
                     result=result,
                     traces=list(span.traces),
-                    duration=span.end_ts - span.start_ts,
+                    duration=wall,
+                    own_duration=own_time,
                 ))
+                metrics = _compute_metrics(span, size=stats.size, own_size=stats.own_size)
+                emit_event(
+                    "end",
+                    id=span.id,
+                    kwargs={"cache_key": key, **metrics.as_kwargs()},
+                )
                 return result
 
             except BaseException as exc:
-                # Distinguish cancellation from errors
+                span.end_ts = time.monotonic()
                 if isinstance(exc, asyncio.CancelledError):
                     emit_event("cancel", id=span.id)
                 else:
-                    emit_event("error", id=span.id, error=str(exc))
-
                     # Store error for browsability (keyed to resolved args)
                     store = get_store()
                     err_key = compute_cache_key(_identity.hash, _version.hash, resolved)
                     stored_error: Exception | None = exc if isinstance(exc, Exception) else None
-                    store.put(err_key, CacheEntry(
+                    wall = span.end_ts - span.start_ts
+                    own_time = wall - span.suspended_total
+                    stats = store.put(err_key, CacheEntry(
                         result=None,
                         traces=list(span.traces),
                         error=stored_error,
+                        duration=wall,
+                        own_duration=own_time,
                     ))
+                    metrics = _compute_metrics(span, size=stats.size, own_size=stats.own_size)
+                    emit_event(
+                        "error",
+                        id=span.id,
+                        error=str(exc),
+                        kwargs=metrics.as_kwargs(),
+                    )
                 raise
 
             finally:
