@@ -240,9 +240,9 @@ def step(
     Use memo=True for expensive leaf operations (API calls, heavy computation)
     to cache results based on (identity, version, args).
 
-    `identity` / `version` override the derived name / body as strings. To
+    `identity` / `version` override the derived name / version as strings. To
     forward an existing `StepInfo` through a higher-order wrapper, pass
-    `identity=info.name, version=info.body`.
+    `identity=info.name, version=info.version`.
 
     Returns Handle[T] on call instead of awaiting directly.
     """
@@ -266,7 +266,7 @@ def _make_step(
     _info = StepInfo.from_function(
         fn,
         name=_resolve_override(identity, fn),
-        body=_resolve_override(version, fn),
+        version=_resolve_override(version, fn),
     )
 
     @functools.wraps(fn)

@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+from .hash import compute_cache_key, resolve_hashable
+
 
 _UNRESOLVED = object()
 _MISSING = object()
@@ -94,17 +96,16 @@ def _encode_ref(name: str, value: Any, _seen: dict[int, str]) -> str:
         return f"{name}=<class:{module}:{qualname}>"
     if inspect.isfunction(value) or inspect.ismethod(value):
         sub = StepInfo.from_function(value, _seen=_seen)
-        return f"{name}={sub.version_hash}"
+        return f"{name}={sub.version}"
     if inspect.isbuiltin(value):
         module = getattr(value, "__module__", "?")
         qualname = getattr(value, "__qualname__", getattr(value, "__name__", "?"))
         return f"{name}=<builtin:{module}:{qualname}>"
+
     # Non-callable value: route through resolve_hashable so Path / partial /
     # user-registered hashers apply. Degrade to a stable fallback on TypeError
     # — AST refs include incidental module-level values the function may not
     # actually depend on, so silent passthrough beats blocking decoration.
-    from .hash import resolve_hashable
-
     try:
         resolved = resolve_hashable(value)
         return f"{name}={json.dumps(resolved, sort_keys=True, separators=(',', ':'))}"
@@ -116,26 +117,23 @@ def _encode_ref(name: str, value: Any, _seen: dict[int, str]) -> str:
         return f"{name}=<opaque:{type(value).__name__}>"
 
 
-def _derive_name(fn: Any) -> str:
-    """Module-qualified name for a function: `module:qualname`."""
-    module = getattr(fn, "__module__", "<unknown>")
-    qualname = getattr(fn, "__qualname__", getattr(fn, "__name__", "<unknown>"))
-    return f"{module}:{qualname}"
+_CYCLE_SENTINEL = hashlib.sha256(b"<cycle>").hexdigest()
 
 
-def _derive_body(fn: Any, _seen: dict[int, str] | None = None) -> str:
-    """Canonical body string: source + sorted resolved refs.
+def _derive_body_fingerprint(fn: Any, _seen: dict[int, str] | None = None) -> str:
+    """Hex digest over fn's source + resolved refs, built incrementally.
 
-    `_seen` dedupes work across a single walk. Cycle sentinel goes in on entry;
-    real body string replaces it on exit. Revisit returns `_seen[fn_id]` — the
-    cycle sentinel for an in-flight call, the real body for a completed one.
+    `_seen` dedupes within one walk: the cycle sentinel is stashed on entry
+    and replaced by the real digest on exit. A revisit returns whatever is
+    there — the sentinel for an in-flight call (true cycle), the final digest
+    for a completed one (duplicate ref).
     """
     if _seen is None:
         _seen = {}
     fn_id = id(fn)
     if fn_id in _seen:
         return _seen[fn_id]
-    _seen[fn_id] = "<cycle>"
+    _seen[fn_id] = _CYCLE_SENTINEL
 
     tree: ast.AST | None
     try:
@@ -150,15 +148,18 @@ def _derive_body(fn: Any, _seen: dict[int, str] | None = None) -> str:
             source = f"<no-source:{tp_name}>"
         tree = None
 
-    parts: list[str] = [source]
+    hasher = hashlib.sha256()
+    hasher.update(source.encode())
     if tree is not None:
-        refs = _collect_refs(tree, fn)
-        for name in sorted(refs):
-            parts.append(_encode_ref(name, refs[name], _seen))
+        # AST walk order is deterministic for identical source, and source is
+        # already fed into the hash — no need to sort refs here.
+        for name, value in _collect_refs(tree, fn).items():
+            hasher.update(b"\n")
+            hasher.update(_encode_ref(name, value, _seen).encode())
 
-    body = "\n".join(parts)
-    _seen[fn_id] = body
-    return body
+    digest = hasher.hexdigest()
+    _seen[fn_id] = digest
+    return digest
 
 
 @dataclass(frozen=True)
@@ -166,21 +167,12 @@ class StepInfo:
     """Identification of a step: a nominal name + a structural fingerprint.
 
     `name` answers "what function is this?" (module:qualname by default, stable
-    across edits). `body` answers "which implementation?" (source + resolved
-    refs). The two hashes are projections; `cache_key(args)` combines both.
+    across edits). `version` answers "which implementation?" — a sha256 digest
+    over source + resolved refs. `cache_key(args)` combines both with args.
     """
 
     name: str
-    body: str
-    identity_hash: str = field(init=False, repr=False, compare=False)
-    version_hash: str = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        # Precompute hashes once. Frozen-dataclass assignment goes through
-        # object.__setattr__. Hashes are derived from name/body so excluding
-        # them from eq/hash is just avoiding redundant work.
-        object.__setattr__(self, "identity_hash", hashlib.sha256(self.name.encode()).hexdigest())
-        object.__setattr__(self, "version_hash", hashlib.sha256(self.body.encode()).hexdigest())
+    version: str
 
     @classmethod
     def from_function(
@@ -188,17 +180,17 @@ class StepInfo:
         fn: object,
         *,
         name: str | None = None,
-        body: str | None = None,
+        version: str | None = None,
         _seen: dict[int, str] | None = None,
     ) -> StepInfo:
-        """Derive StepInfo from fn. `name` / `body` override their derivation.
+        """Derive StepInfo from fn. `name` / `version` override their derivation.
 
         Respects a pre-attached `.info` (how @step wrappers expose their, possibly
         user-overridden, info to downstream hashers like `_hash_partial`).
         Decorators are peeled via `inspect.unwrap` so the real body is hashed.
         """
         existing = getattr(fn, "info", None)
-        if isinstance(existing, StepInfo) and name is None and body is None:
+        if isinstance(existing, StepInfo) and name is None and version is None:
             return existing
 
         try:
@@ -206,20 +198,24 @@ class StepInfo:
         except (ValueError, TypeError):
             unwrapped = fn
 
-        resolved_name = name if name is not None else _derive_name(unwrapped)
-        resolved_body = body if body is not None else _derive_body(unwrapped, _seen)
-        return cls(resolved_name, resolved_body)
+        if name is None:
+            module = getattr(unwrapped, "__module__", "<unknown>")
+            qualname = getattr(unwrapped, "__qualname__", getattr(unwrapped, "__name__", "<unknown>"))
+            name = f"{module}:{qualname}"
+
+        if version is None:
+            version = _derive_body_fingerprint(unwrapped, _seen)
+
+        return cls(name, version)
 
     def short_version(self) -> str:
-        return self.version_hash[:8]
+        return self.version[:8]
 
     def cache_key(self, args: dict[str, Any]) -> str:
-        from .hash import compute_cache_key
-
-        return compute_cache_key(self.identity_hash, self.version_hash, args)
+        return compute_cache_key(self.name, self.version, args)
 
     def __repr__(self) -> str:
-        return f"StepInfo({self.name!r}, v={self.short_version()})"
+        return f"StepInfo({self.name!r}, version={self.short_version()})"
 
 
 @dataclass

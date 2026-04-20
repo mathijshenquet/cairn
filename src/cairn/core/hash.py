@@ -93,12 +93,12 @@ def resolve_hashable(value: Any, _seen: dict[int, bool] | None = None) -> Any:
     )
 
 
-def compute_cache_key(identity_hash: str, version_hash: str, resolved_args: dict[str, Any]) -> str:
+def compute_cache_key(identity: str, version: str, resolved_args: dict[str, Any]) -> str:
     """Compute a cache key from identity, version, and resolved arguments."""
     canonical = json.dumps(
         {
-            "identity": identity_hash,
-            "version": version_hash,
+            "identity": identity,
+            "version": version,
             "args": resolve_hashable(resolved_args),
         },
         sort_keys=True,
@@ -131,7 +131,7 @@ def _hash_partial(p: "functools.partial[Any]") -> Any:
 
     return {
         "__partial__": {
-            "func": StepInfo.from_function(p.func).version_hash,
+            "func": StepInfo.from_function(p.func).version,
             "args": [resolve_hashable(a) for a in p.args],
             "keywords": {k: resolve_hashable(v) for k, v in p.keywords.items()},
         }
