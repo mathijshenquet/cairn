@@ -19,7 +19,7 @@ from cairn import step, run, trace
 @step(memo=True)  # cache fetched pages — the expensive leaf
 async def fetch_page(url: str) -> str:
     """Mock HTTP fetch with simulated latency."""
-    trace("fetching", url=url)
+    trace("fetching")
     await asyncio.sleep(0.1)
     h = hashlib.md5(url.encode()).hexdigest()[:6]
     return f"""<html>
@@ -57,7 +57,7 @@ async def extract_product(html: str) -> dict[str, str]:
 @step
 async def scrape_site(urls: list[str]) -> list[dict[str, str]]:
     """Scrape multiple URLs concurrently."""
-    trace("starting scrape", url_count=len(urls))
+    trace(f"starting scrape ({len(urls)} urls)")
 
     # Fan-out: fetch all pages concurrently
     pages = {url: fetch_page(url) for url in urls}
@@ -71,9 +71,9 @@ async def scrape_site(urls: list[str]) -> list[dict[str, str]]:
         product = await handle
         product["url"] = url
         products.append(product)
-        trace("scraped", url=url, title=product["title"])
+        trace(f"scraped: {product['title']}")
 
-    trace("scrape complete", product_count=len(products))
+    trace(f"scrape complete ({len(products)} products)")
     return products
 
 

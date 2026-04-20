@@ -39,12 +39,12 @@ def _set_attempt(n: int) -> None:
 @step(memo=True)  # cache successful items — skip on rerun
 async def process_item(item: str) -> str:
     """Process a single item. Item 'C' fails on first attempt."""
-    trace("processing", item=item)
+    trace("processing")
     await asyncio.sleep(0.05)
 
     attempt = _get_attempt()
     if item == "C" and attempt == 1:
-        trace("failing!", item=item)
+        trace("failing!", level="error")
         raise RuntimeError(f"Processing '{item}' failed (attempt {attempt})")
 
     return f"Result for {item}: OK (attempt {attempt})"
@@ -53,14 +53,14 @@ async def process_item(item: str) -> str:
 @step
 async def pipeline() -> list[str]:
     items = ["A", "B", "C", "D", "E"]
-    trace("starting", item_count=len(items))
+    trace(f"starting ({len(items)} items)")
 
     results: list[str] = []
     for item in items:
-        trace("processing item", item=item)
+        trace("processing item")
         result = await process_item(item)
         results.append(result)
-        trace("completed", item=item)
+        trace("completed")
 
     return results
 

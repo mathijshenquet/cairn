@@ -45,7 +45,7 @@ def current_week() -> str:
 @rate_limited(n=3, memo=True)
 async def angle_search(company: str, angle: str, week: str) -> str:
     """Web-search a single angle on a company. `week` is cache-bust."""
-    trace("searching", company=company, angle=angle, week=week)
+    trace("searching")
     prompt = (
         f"Search the web for news from the past 7 days about {company}, "
         f"focused on: {angle}. Current ISO week: {week}. "
@@ -58,7 +58,7 @@ async def angle_search(company: str, angle: str, week: str) -> str:
 @step(memo=True)
 async def critique(company: str, findings: dict[str, str]) -> str:
     """Critique the raw findings: what's missing, weak, or contradictory."""
-    trace("critiquing", company=company)
+    trace("critiquing")
     joined = "\n\n".join(f"## {a}\n{f}" for a, f in findings.items())
     prompt = (
         f"You are a skeptical analyst reviewing findings on {company}. "
@@ -71,7 +71,7 @@ async def critique(company: str, findings: dict[str, str]) -> str:
 @step(memo=True)
 async def refine(company: str, findings: dict[str, str], critique_text: str) -> str:
     """Produce a polished company brief incorporating the critique."""
-    trace("refining", company=company)
+    trace("refining")
     joined = "\n\n".join(f"## {a}\n{f}" for a, f in findings.items())
     prompt = (
         f"Write a tight one-paragraph brief on {company} based on the "
@@ -85,7 +85,7 @@ async def refine(company: str, findings: dict[str, str], critique_text: str) -> 
 @step
 async def research_company(company: str, week: str) -> dict[str, str]:
     """Fan out across angles, critique, then refine into a brief."""
-    trace("researching", company=company)
+    trace("researching")
 
     handles = {a: angle_search(company, a, week) for a in ANGLES}
     findings: dict[str, str] = {}
@@ -100,7 +100,7 @@ async def research_company(company: str, week: str) -> dict[str, str]:
 @step(memo=True)
 async def synthesize(briefs: dict[str, str], week: str) -> str:
     """Cross-company synthesis: what's the landscape looking like this week."""
-    trace("synthesizing", company_count=len(briefs), week=week)
+    trace(f"synthesizing {len(briefs)} briefs")
     joined = "\n\n".join(f"## {c}\n{b}" for c, b in briefs.items())
     prompt = (
         f"You are a strategist. Given these per-company briefs for ISO week "
@@ -113,7 +113,7 @@ async def synthesize(briefs: dict[str, str], week: str) -> str:
 @step
 async def pipeline() -> dict[str, object]:
     week = current_week()
-    trace("pipeline start", week=week, companies=len(COMPANIES))
+    trace(f"pipeline start (week={week}, {len(COMPANIES)} companies)")
 
     handles = {c: research_company(c, week) for c in COMPANIES}
     per_company: dict[str, dict[str, str]] = {}

@@ -136,7 +136,6 @@ async def claude(
                         tool["name"],
                         detail=json.dumps(inp, indent=2),
                         state="running",
-                        ref=tool["id"],
                     )
 
         # Completed user message: carries tool_result blocks for any tool we just ran.
@@ -153,7 +152,6 @@ async def claude(
                     f"→ {_preview(text)}",
                     detail=text,
                     level="error" if b.get("is_error") else "info",
-                    ref=str(b.get("tool_use_id", "")),
                 )
 
         # Final result event: emit cost + return the text.

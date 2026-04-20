@@ -37,7 +37,7 @@ async def test_validated_loop() -> None:
             result: dict[str, object] = await validate(draft)
             if result["success"]:
                 return draft
-            trace("retrying", edge=True, attempt=i + 1)
+            trace("retrying", edge=True, progress=(i + 1, 3))
             draft = await refine(draft, str(result["feedback"]))
         return draft
 
@@ -48,7 +48,7 @@ async def test_validated_loop() -> None:
         # Should have gone through generate → validate (fail) → refine → validate (pass)
         edges = rt.trace.edge_annotations("validated")
         assert len(edges) == 1
-        assert edges[0].kwargs["attempt"] == 1
+        assert edges[0].kwargs["progress"] == (1, 3)
 
 
 # ── Human input pattern ──

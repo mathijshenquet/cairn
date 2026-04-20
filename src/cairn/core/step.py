@@ -6,7 +6,7 @@ import asyncio
 import functools
 import inspect
 import time
-from typing import Any, Awaitable, Callable, Generator, Generic, ParamSpec, TypeVar, overload
+from typing import Any, Awaitable, Callable, Generator, Generic, Literal, ParamSpec, TypeVar, overload
 
 from .context import current_span, emit_event, next_id
 from .store import MemoryStore, Store
@@ -94,25 +94,43 @@ class Handle(Generic[R]):
 # ── trace() ──
 
 
-def trace(message: str, detail: str = "", **kwargs: Any) -> None:
+def trace(
+    message: str,
+    *,
+    detail: str = "",
+    progress: tuple[int, int] | None = None,
+    state: str | None = None,
+    level: Literal["info", "warn", "error"] = "info",
+    cost: dict[str, int | float] | None = None,
+    edge: bool = False,
+) -> None:
     """Emit a trace annotation on the current span.
 
-    `message` is the short label shown on the timeline. `detail` is optional
-    markdown-shaped text shown when the trace is selected.
-
-    Blessed kwargs (known to renderers and aggregators):
-      progress: tuple[int, int] — (current, total), renders as a bar
-      state:    str             — sub-lifecycle tag ("waiting", "retrying", …)
-      level:    "info"|"warn"|"error" — severity; default "info"
-      cost:     dict[str, int | float] — numeric columns summed up the span
-                tree, e.g. {"tokens_in": 10, "tokens_out": 40, "cost_usd": 0.03}
-
-    Any other kwargs are preserved in trace.jsonl and rendered generically.
+    Fields:
+      message  — short label shown on the timeline
+      detail   — optional free-form text shown when the trace is selected
+      progress — (current, total); renders as a bar
+      state    — sub-lifecycle tag ("waiting", "retrying", …)
+      level    — severity; "info" (default), "warn", "error"
+      cost     — numeric columns summed up the span tree, e.g.
+                 {"tokens_in": 10, "tokens_out": 40, "cost_usd": 0.03}
+      edge     — mark this trace as an edge annotation (fan-out/retry transition)
     """
-    parent = current_span.get()
-    merged = dict(kwargs)
+    merged: dict[str, Any] = {}
     if detail:
         merged["detail"] = detail
+    if progress is not None:
+        merged["progress"] = progress
+    if state is not None:
+        merged["state"] = state
+    if level != "info":
+        merged["level"] = level
+    if cost is not None:
+        merged["cost"] = cost
+    if edge:
+        merged["edge"] = True
+
+    parent = current_span.get()
     emit_event(
         "trace",
         parent_id=parent.id if parent else None,

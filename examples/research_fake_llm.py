@@ -24,13 +24,15 @@ _api_sem: asyncio.Semaphore | None = None
 async def fake_api_call(prompt: str) -> str:
     """Simulates a API call. Fails ~20% of the time, rate limited."""
     # Rate limit
-    trace("calling LLM API", prompt_len=len(prompt), status="running")
+    trace(f"calling LLM API ({len(prompt)} chars)", state="running")
     await asyncio.sleep(random.uniform(*_delay))
 
     # Random failures
     if random.random() < _fail_rate:
-        trace("API error", status="error")
+        trace("API error", level="error")
         raise ConnectionError("Claude API: 529 Overloaded")
+    
+    trace("API call successful", cost={"tokens": 1000})
 
     # Deterministic-ish response based on prompt hash
     h = hashlib.md5(prompt.encode()).hexdigest()[:8]
@@ -71,12 +73,12 @@ async def llm(prompt: str) -> str:
     for attempt in range(2):
         try:
             if attempt > 0:
-                trace("retrying API call", attempt=attempt + 1)
+                trace("retrying API call", progress=(attempt + 1, 2))
                 await asyncio.sleep(0.5 * attempt)  # backoff
             return await fake_api_call(prompt)
         except ConnectionError as e:
             last_error = e
-            trace("API failed, will retry", error=str(e), attempt=attempt + 1)
+            trace("API failed, will retry", detail=str(e), progress=(attempt + 1, 2), level="warn")
     raise last_error or ConnectionError("max retries exceeded")
 
 
@@ -85,7 +87,7 @@ async def llm(prompt: str) -> str:
 
 @step
 async def research(subject: str, spec: str) -> str:
-    trace("researching", subject=subject)
+    trace("researching")
     return await llm(f"Research {subject} according to: {spec}")
 
 
@@ -112,15 +114,15 @@ async def research_validated(subject: str, spec: str) -> str:
     """Research with validation loop — retries until validated or max attempts."""
     draft = await research(subject, spec)
     for i in range(3):
-        trace("validating", progress=(i + 1, 3), subject=subject)
+        trace("validating", progress=(i + 1, 3))
         result = await validate(spec, draft)
         if result.get("success"):
-            trace("validated", subject=subject, attempts=i + 1)
+            trace("validated", progress=(i + 1, 3))
             return draft
         feedback = str(result.get("feedback", "needs improvement"))
-        trace("retrying", edge=True, attempt=i + 1, feedback=feedback)
+        trace("retrying", edge=True, progress=(i + 1, 3), detail=feedback)
         draft = await refine(subject, draft, feedback)
-    trace("max retries reached", subject=subject)
+    trace("max retries reached", level="warn")
     return draft
 
 
@@ -143,7 +145,7 @@ SPEC = "Comprehensive report covering habitat, diet, behavior, and conservation 
 async def pipeline(subjects: list[str] | None = None) -> dict[str, str]:
     """Research pipeline: fan-out across subjects."""
     animals = subjects or ANIMALS_SMALL
-    trace("starting pipeline", subject_count=len(animals))
+    trace(f"starting pipeline ({len(animals)} subjects)")
 
     handles = {s: research_validated(s, SPEC) for s in animals}
 

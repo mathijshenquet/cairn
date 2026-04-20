@@ -8,7 +8,7 @@ import json
 import os
 import time
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from rich.text import Text
 from textual import on
@@ -184,6 +184,12 @@ class CairnApp(App[None]):
         self._pending_input_widgets: dict[int, Input] = {}
         self._reset_span_state()
 
+    @property
+    def _tree(self) -> TextualTree[str]:
+        # query_one uses isinstance() on the expect_type, which fails with
+        # subscripted generics — pass the base class and cast to the parameterized form.
+        return cast(TextualTree[str], self.query_one("#tree", TextualTree))
+
     def _update_detail(self, content: "Text | str") -> None:
         detail = self.query_one("#detail", Static)
         detail.update(content)
@@ -252,7 +258,7 @@ class CairnApp(App[None]):
         runs = list_runs(self._store_path)
         self._runs_by_id = {r.run_id: r for r in runs}
 
-        tree = self.query_one("#tree", TextualTree[str])
+        tree = self._tree
         tree.clear()
         tree.show_root = False
         tree.root.expand()
@@ -287,7 +293,7 @@ class CairnApp(App[None]):
         self._reset_span_state()
         self.sub_title = title
         self.refresh_bindings()
-        tree = self.query_one("#tree", TextualTree[str])
+        tree = self._tree
         tree.clear()
         tree.show_root = False
         tree.root.expand()
@@ -321,7 +327,7 @@ class CairnApp(App[None]):
         """Feed an event into the SpanGraph and reflect the change in the tree."""
         self.graph.apply(e)
         kind: str = e.get("e", "")
-        tree = self.query_one("#tree", TextualTree[str])
+        tree = self._tree
 
         if kind == "spawn":
             span_id = int(e["id"])
@@ -472,11 +478,6 @@ class CairnApp(App[None]):
             out.append("Error:\n", style="bold red")
             out.append(f"{s.error}\n\n", style="red")
 
-        rolled = self.graph.rolled_cost(span_id)
-        if rolled:
-            out.append("Cost: ", style="bold")
-            out.append(format_cost(rolled) + "\n\n", style="dim")
-
         traces = s.traces
 
         # Result (from cached output) — acts as the virtual last trace.
@@ -557,6 +558,14 @@ class CairnApp(App[None]):
                 out.append("\nResult:\n", style="bold")
                 for line in result_str.splitlines() or [result_str]:
                     out.append(f"{line}\n")
+
+        rolled = self.graph.rolled_cost(span_id)
+        if rolled:
+            out.append("\nCosts:\n", style="bold")
+            key_w = max(len(k) for k in rolled)
+            for k, v in rolled.items():
+                val = f"{v:g}" if isinstance(v, float) else str(v)
+                out.append(f"  {k.ljust(key_w)}  {val}\n", style="dim")
 
         self._update_detail(out)
         self._sync_input_visibility(span_id)
@@ -703,7 +712,7 @@ class CairnApp(App[None]):
             # chain. Skipped if the user is already typing somewhere.
             node = self.span_tree_nodes.get(msg.span_id)
             if node is not None:
-                self.query_one("#tree", TextualTree[str]).select_node(node)
+                self._tree.select_node(node)
 
     @on(Input.Submitted)
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -721,7 +730,7 @@ class CairnApp(App[None]):
         event.input.remove()
 
         # Refocus: next pending input in tree DFS order, else the tree itself.
-        tree = self.query_one("#tree", TextualTree[str])
+        tree = self._tree
         next_span = self._next_pending_input_span()
         if next_span is not None:
             node = self.span_tree_nodes.get(next_span)
@@ -736,7 +745,7 @@ class CairnApp(App[None]):
         """Next span awaiting input, in DFS tree order, cycling past current."""
         if not self._pending_input_widgets:
             return None
-        tree = self.query_one("#tree", TextualTree[str])
+        tree = self._tree
         order: list[int] = []
         stack: list[TreeNode[str]] = list(reversed(list(tree.root.children)))
         while stack:

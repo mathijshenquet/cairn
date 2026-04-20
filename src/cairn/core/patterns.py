@@ -47,9 +47,9 @@ def rate_limited(n: int, memo: bool = False) -> Callable[[Callable[P, Awaitable[
     def decorator(fn: Callable[P, Awaitable[R]]) -> Callable[P, Handle[R]]:
         @functools.wraps(fn)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-            trace("waiting for slot", status="pending")
+            trace("waiting for slot", state="pending")
             async with sem:
-                trace("acquired slot", status="running")
+                trace("acquired slot", state="running")
                 return await fn(*args, **kwargs)
 
         info = StepInfo.from_function(fn)

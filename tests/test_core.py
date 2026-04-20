@@ -311,10 +311,10 @@ async def test_cached_tracing_replays_traces():
         prev_traces = cached_tracing()
         if prev_traces is not None:
             for t in prev_traces:
-                trace(f"replayed: {t.message}", **t.kwargs)
+                trace(f"replayed: {t.message}")
             return cached_output()
-        trace("doing work", step=1)
-        trace("almost done", step=2)
+        trace("doing work")
+        trace("almost done")
         return x * 2
 
     async with Runtime() as rt:
@@ -474,7 +474,7 @@ async def test_edge_annotation():
     @step
     async def parent() -> str:
         await step_a()
-        trace("transition", edge=True, reason="moving on")
+        trace("transition", edge=True, detail="moving on")
         await step_b()
         return "done"
 
@@ -483,7 +483,7 @@ async def test_edge_annotation():
         edges = rt.trace.edge_annotations("parent")
         assert len(edges) == 1
         assert edges[0].message == "transition"
-        assert edges[0].kwargs["reason"] == "moving on"
+        assert edges[0].kwargs["detail"] == "moving on"
 
 
 # ── Hash funcs registry ──
