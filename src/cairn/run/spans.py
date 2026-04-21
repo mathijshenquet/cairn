@@ -4,7 +4,7 @@ Shared by `show.LiveRenderer` and `tui.CairnApp`: feed events through
 `SpanGraph.apply(event)` and read derived state off the graph.
 
 `effective_status(id)` bubbles the wait chain so a parent blocked on a
-child blocked on a human surfaces as `awaiting_input`.
+running child surfaces as `running`.
 """
 
 from __future__ import annotations
@@ -13,18 +13,15 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 
-WaitKind = Literal["span", "group", "input"]
+WaitKind = Literal["span", "group"]
 SpanStatus = Literal["pending", "running", "ok", "cached", "error", "cancelled"]
-EffectiveStatus = Literal[
-    "pending", "running", "awaiting_input",
-    "ok", "cached", "error", "cancelled",
-]
+EffectiveStatus = SpanStatus
 
 
 @dataclass
 class Wait:
     kind: WaitKind
-    target: int | list[int]   # span id | list of span ids | input_request id
+    target: int | list[int]   # span id | list of span ids
 
 
 @dataclass
@@ -43,19 +40,9 @@ class Span:
     traces: list[dict[str, Any]] = field(default_factory=lambda: cast(list[dict[str, Any]], []))
 
 
-@dataclass
-class InputInfo:
-    id: int
-    prompt: str
-    owner: int | None             # anchor span, from `by` on input_request
-    metadata: dict[str, Any] = field(default_factory=lambda: cast(dict[str, Any], {}))
-    pending: bool = True
-
-
 # Precedence for reducing over a set of statuses. Higher wins.
 _PRIORITY: dict[str, int] = {
     "error": 5,
-    "awaiting_input": 4,
     "running": 3,
     "pending": 2,
     "cancelled": 1,
@@ -70,7 +57,6 @@ class SpanGraph:
     def __init__(self) -> None:
         self.spans: dict[int, Span] = {}
         self.open_waits: dict[int, list[Wait]] = {}      # span id → stack
-        self.inputs: dict[int, InputInfo] = {}           # input req id → info
         self.first_ts: float | None = None
 
     def apply(self, e: dict[str, Any]) -> None:
@@ -124,8 +110,6 @@ class SpanGraph:
             elif wkind == "group":
                 ids_raw = cast(list[Any], on.get("ids") or [])
                 w = Wait(kind="group", target=[int(x) for x in ids_raw])
-            elif wkind == "input" and "id" in on:
-                w = Wait(kind="input", target=int(on["id"]))
             if w is not None:
                 self.open_waits.setdefault(span_id, []).append(w)
 
@@ -141,23 +125,6 @@ class SpanGraph:
             if parent_id is not None and int(parent_id) in self.spans:
                 rec = {k: v for k, v in e.items() if k != "e"}
                 self.spans[int(parent_id)].traces.append(rec)
-
-        elif kind == "input_request":
-            req_id = int(e["id"])
-            owner = e.get("by")
-            meta = {k: v for k, v in e.items() if k not in ("e", "ts", "id", "msg", "by")}
-            self.inputs[req_id] = InputInfo(
-                id=req_id,
-                prompt=str(e.get("msg", "")),
-                owner=int(owner) if owner is not None else None,
-                metadata=meta,
-                pending=True,
-            )
-
-        elif kind == "input_response":
-            info = self.inputs.get(int(e["id"]))
-            if info is not None:
-                info.pending = False
 
     # ── Queries ──
 
@@ -187,8 +154,6 @@ class SpanGraph:
         stack = self.open_waits.get(span_id)
         if stack:
             w = stack[-1]
-            if w.kind == "input":
-                return "awaiting_input"
             if w.kind == "span":
                 assert isinstance(w.target, int)
                 return self._effective(w.target, visited)

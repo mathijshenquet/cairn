@@ -1,11 +1,11 @@
 """Minimal human-in-the-loop example.
 
-Demonstrates `await_input` inside a @step. Run in the TUI:
+Demonstrates the three typed interaction primitives. Run in the TUI:
 
     cairn examples/hitl.py
 
-An Input widget mounts in the detail pane when each step asks a question.
-Submit the value to continue.
+Input/Choice/Confirm widgets mount in the detail pane when each step asks
+a question. Submit the value to continue.
 
 Run headless (stdin fallback):
 
@@ -13,33 +13,42 @@ Run headless (stdin fallback):
 """
 
 from __future__ import annotations
-import asyncio
 
 from cairn import run, step, trace
-from cairn.interaction import await_input
+from cairn.interaction import await_choice, await_confirm, await_input
 
 
 @step
 async def greet() -> str:
-    name = await await_input("What's your name?")
+    name = await await_input("What's your name?", placeholder="e.g. Ada")
     trace(f"Hello, {name}!")
     return name
 
 
 @step
-async def ask(thing: str) -> str:
-    return await await_input(f"Favorite {thing}?")
+async def pick_mood() -> str:
+    return await await_choice(
+        "Pick a mood",
+        {
+            "happy":     "sunshine, rainbows, the works",
+            "grumpy":    "leave me alone, I'm reading",
+            "curious":   "what does this button do?",
+        },
+        default="curious",
+    )
 
 
 @step
 async def pipeline() -> str:
     name = await greet()
+    mood = await pick_mood()
 
-    favorites_ = {thing: ask(thing) for thing in ["color", "food"]}
+    go = await await_confirm(f"{name} is feeling {mood}. Sound right?", default=True)
+    if not go:
+        trace("starting over", level="warn")
+        return await pipeline()
 
-    favorites = {thing: await fav for thing, fav in favorites_.items()}
-
-    return "{name} likes {color} {food}'s".format(name=name, **favorites)
+    return f"{name} ({mood})"
 
 
 main = pipeline
@@ -49,5 +58,4 @@ if __name__ == "__main__":
     from cairn.interaction import StdinInteractionSink, set_interaction_sink
 
     set_interaction_sink(StdinInteractionSink())
-    result = run(pipeline, store_path=".cairn")
-    print(result)
+    print(run(pipeline, store_path=".cairn"))
