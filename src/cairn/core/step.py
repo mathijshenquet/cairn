@@ -144,7 +144,7 @@ def trace(
 # ── cached_output() / cached_tracing() ──
 
 
-def cached_output() -> Any:
+def cached_output[T](ty: type[T]) -> T | None:
     """Get the previous cached result for the current step, or None."""
     span = current_span.get()
     if span is None:

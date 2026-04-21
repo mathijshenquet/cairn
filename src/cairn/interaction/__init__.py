@@ -123,7 +123,7 @@ def _caller_span() -> int | None:
 # ── Memoized internals (one @step per widget) ──
 
 
-@step(memo=True)
+@step
 async def _input(
     prompt: str, default: str | None, placeholder: str | None
 ) -> str:
@@ -135,7 +135,7 @@ async def _input(
     )
 
 
-@step(memo=True)
+@step
 async def _choice(
     prompt: str, options: dict[Any, str], default: Any
 ) -> Any:
@@ -147,7 +147,7 @@ async def _choice(
     )
 
 
-@step(memo=True)
+@step
 async def _confirm(prompt: str, default: bool | None) -> bool:
     return await _require_sink().request_confirm(
         prompt,
