@@ -15,37 +15,38 @@ wheels = [
 name = "cairn"
 version = "0.2.0"
 source = { editable = "." }
-dependencies = [
-    { name = "rich" },
-]
 
 [package.optional-dependencies]
 dev = [
     { name = "import-linter" },
+    { name = "pydantic" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "rich" },
     { name = "textual" },
 ]
 full = [
     { name = "pydantic" },
+    { name = "rich" },
     { name = "textual" },
 ]
 pydantic = [
     { name = "pydantic" },
 ]
 tui = [
+    { name = "rich" },
     { name = "textual" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "cairn", extras = ["full"], marker = "extra == 'dev'" },
     { name = "cairn", extras = ["tui", "pydantic"], marker = "extra == 'full'" },
     { name = "import-linter", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "pydantic", marker = "extra == 'pydantic'", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.25.0" },
-    { name = "rich", specifier = ">=13.0" },
-    { name = "textual", marker = "extra == 'dev'", specifier = ">=3.0" },
+    { name = "rich", marker = "extra == 'tui'", specifier = ">=13.0" },
     { name = "textual", marker = "extra == 'tui'", specifier = ">=3.0" },
 ]
 provides-extras = ["pydantic", "tui", "full", "dev"]

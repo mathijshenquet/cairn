@@ -3,18 +3,22 @@ name = "cairn"
 version = "0.2.0"
 description = "Compute graph orchestration with caching and observability"
 requires-python = ">=3.12"
-dependencies = [
-    "rich>=13.0",
-]
 
 [project.optional-dependencies]
-pydantic = ["pydantic>=2.0"]
-tui = ["textual>=3.0"]
-full = ["cairn[tui,pydantic]"]
+pydantic = [
+    "pydantic>=2.0"
+]
+tui = [
+    "textual>=3.0",
+    "rich>=13.0"
+]
+full = [
+    "cairn[tui,pydantic]"
+]
 dev = [
+    "cairn[full]",
     "pytest>=8.0",
     "pytest-asyncio>=0.25.0",
-    "textual>=3.0",
     "import-linter>=2.0",
 ]
 
